@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "requests",
+    "urllib3>=2",
     "joblib",
     "astropy",
     "named-arrays~=2.14",

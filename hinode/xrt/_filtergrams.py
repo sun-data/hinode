@@ -1,6 +1,7 @@
 from typing import Sequence
 import typing
 import os
+import re
 import pathlib
 import dataclasses
 import numpy as np
@@ -18,10 +19,22 @@ __all__ = [
 _value_missing = -999
 """The value ``xrt_prep`` gives to the pixels with no data."""
 
-_level_saturation = 2500 * u.DN
+_pattern_normalized = re.compile(
+    r"\(XRT_RENORMALIZE\) Normalized from [\d.]+ sec --> ([\d.]+) sec"
+)
 """
-The signal above which ``xrt_prep`` considers a pixel saturated,
-and to which it sets every saturated pixel.
+The entry in the history of a file which ``xrt_prep`` writes when it divides
+the image by its exposure time,
+and the exposure time it normalized the image to.
+"""
+
+_pattern_saturated = re.compile(
+    r"\(XRT_SATURATED_PIXELS\) Replaced \d+ saturated pixels with value = ([\d.]+)"
+)
+"""
+The entry in the history of a file which ``xrt_prep`` writes when it sets
+every pixel above the saturation level to that level,
+and the level.
 """
 
 _center_vignetting = 1024
@@ -96,6 +109,79 @@ def _vignetting(
     return 1 - (2 / 3) * (angle / _angle_graze).to(u.dimensionless_unscaled)
 
 
+def _history(header: astropy.io.fits.Header) -> str:
+    """
+    The ``HISTORY`` of a header as one string,
+    with the lines which continue an entry joined to it.
+
+    Parameters
+    ----------
+    header
+        The primary header of an XRT file.
+    """
+    lines = [str(line) for line in header.get("HISTORY") or []]
+    return " ".join(line.removeprefix("(cont'd) ") for line in lines)
+
+
+def _check_normalized(
+    header: astropy.io.fits.Header,
+    path: str | os.PathLike,
+) -> None:
+    """
+    Check that ``xrt_prep`` divided an image by its exposure time,
+    which it does only if asked to.
+
+    Parameters
+    ----------
+    header
+        The primary header of an XRT file.
+    path
+        The file, for the error message.
+
+    Raises
+    ------
+    ValueError
+        If the image is not in DN per second.
+    """
+    exposures = _pattern_normalized.findall(_history(header))
+    if not exposures or float(exposures[-1]) != 1:
+        raise ValueError(
+            f"{path} is not in DN per second, "
+            "since xrt_prep did not normalize it to an exposure time of 1 s, "
+            "which its /normalize keyword does."
+        )
+
+
+def _level_saturation(
+    header: astropy.io.fits.Header,
+    path: str | os.PathLike,
+) -> u.Quantity:
+    """
+    The signal above which ``xrt_prep`` considered a pixel of an image
+    saturated, and which it set every saturated pixel to,
+    as the history of the file records it.
+
+    Parameters
+    ----------
+    header
+        The primary header of an XRT file.
+    path
+        The file, for the error message.
+
+    Raises
+    ------
+    ValueError
+        If the history of the file does not record the level.
+    """
+    levels = _pattern_saturated.findall(_history(header))
+    if not levels:
+        raise ValueError(
+            f"The history of {path} does not say "
+            "which value xrt_prep set its saturated pixels to."
+        )
+    return float(levels[-1]) * u.DN
+
+
 @dataclasses.dataclass(eq=False, repr=False)
 class Filtergram(
     na.FunctionArray[
@@ -115,6 +201,10 @@ class Filtergram(
     Each image is one frame along :attr:`axis_time`,
     and its coordinates come from its own header,
     since the pointing changes from one image to the next.
+
+    The time of each image, ``inputs.time``, is the start of its exposure,
+    ``DATE_OBS``, as in the other sun-data packages,
+    so the middle of each exposure is ``inputs.time + timedelta / 2``.
 
     Examples
     --------
@@ -144,8 +234,7 @@ class Filtergram(
         num_saturated = images.saturated.sum(
             axis=(images.axis_detector_x, images.axis_detector_y),
         )
-        index = {images.axis_time: int(np.argmax(num_saturated.ndarray))}
-        image = images[index]
+        image = images[np.argmax(num_saturated, axis=images.axis_time)]
 
         # Display the image
         unit = image.inputs.position.x.unit
@@ -180,10 +269,11 @@ class Filtergram(
     saturated pixel.
 
     ``xrt_prep`` sets every pixel above the saturation level, 2500 DN,
-    to exactly 2500 DN before correcting for vignetting and dividing by the
-    exposure time, so a pixel is saturated if the product of its value,
+    to exactly that level before correcting for vignetting and dividing by
+    the exposure time, and records the level in the history of the file,
+    so a pixel is saturated if the product of its value,
     the exposure time, and the vignetting function of ``xrt_prep`` is at
-    least 2500 DN.
+    least the recorded level.
     The level is lowered by 0.01% to allow for the rounding of the exposure
     time in the header and of the values stored in the file.
 
@@ -305,6 +395,14 @@ class Filtergram(
         axis_detector_y
             The logical axis corresponding to changes in detector :math:`y`-coordinate.
 
+        Raises
+        ------
+        ValueError
+            If ``xrt_prep`` did not divide an image by its exposure time,
+            which it does only if asked to with its ``/normalize`` keyword,
+            or if the history of a file does not record the value
+            ``xrt_prep`` set the saturated pixels to.
+
         Notes
         -----
         The pixels with no data, which ``xrt_prep`` sets to -999,
@@ -328,28 +426,43 @@ class Filtergram(
         if len(filters) > 1:
             raise ValueError(f"The files are of different filters, {filters}.")
 
-        num_t = len(headers)
-        shape_y = max(int(h["NAXIS2"]) for h in headers)
-        shape_x = max(int(h["NAXIS1"]) for h in headers)
+        # Checked before any of the images are read
+        for p, header in zip(path, headers):
+            _check_normalized(header, p)
+        levels = [_level_saturation(header, p) for p, header in zip(path, headers)]
 
-        axes = (axis_time, axis_detector_y, axis_detector_x)
+        shape = {
+            axis_time: len(headers),
+            axis_detector_y: max(int(h["NAXIS2"]) for h in headers),
+            axis_detector_x: max(int(h["NAXIS1"]) for h in headers),
+        }
 
-        # Filled in place, so that the images are held in memory only once
-        images = np.full((num_t, shape_y, shape_x), np.nan, dtype=np.float32)
-        saturated = na.ScalarArray(np.zeros(images.shape, dtype=bool), axes=axes)
-        for i, (p, header) in enumerate(zip(path, headers)):
-            data = np.asarray(astropy.io.fits.getdata(p, memmap=False))
-            num_y, num_x = data.shape
-            images[i, :num_y, :num_x] = data
+        # Filled in place, one image at a time,
+        # so that the images are held in memory only once,
+        # and the arrays made along the way are no larger than one image.
+        unit_outputs = u.DN / u.s
+        outputs = na.ScalarArray.full(shape, np.nan, dtype=np.float32) << unit_outputs
+        outputs = typing.cast(na.ScalarArray, outputs)
+        saturated = na.ScalarArray.zeros(shape, dtype=bool)
+
+        # Charge bleeds along the columns of the CCD
+        above = {axis_detector_y: slice(1, None)}
+        below = {axis_detector_y: slice(None, ~0)}
+
+        for i, (p, header, level) in enumerate(zip(path, headers, levels)):
+            data = astropy.io.fits.getdata(p, memmap=False)
+            image = na.ScalarArray(
+                ndarray=np.asarray(data, dtype=np.float32),
+                axes=(axis_detector_y, axis_detector_x),
+            )
+            image[image == _value_missing] = np.nan
+            image = typing.cast(na.ScalarArray, image << unit_outputs)
+
+            num_x = image.shape[axis_detector_x]
+            num_y = image.shape[axis_detector_y]
 
             # The signal before ``xrt_prep`` divided it by the vignetting
             # function and by the exposure time.
-            # It is found one image at a time,
-            # so that it needs no more memory than one image.
-            image = na.ScalarArray(
-                ndarray=data << (u.DN / u.s),
-                axes=(axis_detector_y, axis_detector_x),
-            )
             signal = image * (header["EXPTIME"] * u.s)
             if header["EC_IMTY_"] != "dark":
                 signal = signal * _vignetting(
@@ -362,14 +475,22 @@ class Filtergram(
                     axis_detector_y=axis_detector_y,
                 )
 
+            saturated_image = typing.cast(na.ScalarArray, signal >= 0.9999 * level)
+            bleed = saturated_image.copy()
+            bleed[above] = typing.cast(
+                na.ScalarArray, bleed[above] | saturated_image[below]
+            )
+            bleed[below] = typing.cast(
+                na.ScalarArray, bleed[below] | saturated_image[above]
+            )
+
             index = {
                 axis_time: i,
                 axis_detector_y: slice(None, num_y),
                 axis_detector_x: slice(None, num_x),
             }
-            saturated[index] = signal >= 0.9999 * _level_saturation
-
-        images[images == _value_missing] = np.nan
+            outputs[index] = image
+            saturated[index] = bleed & np.isfinite(image)
 
         def scalar(key: str, unit: u.UnitBase | None = None) -> na.ScalarArray:
             a = np.array([h[key] for h in headers], dtype=float)
@@ -438,26 +559,16 @@ class Filtergram(
                 ),
             ),
             shape_wcs={
-                axis_detector_x: shape_x + 1,
-                axis_detector_y: shape_y + 1,
+                axis_detector_x: shape[axis_detector_x] + 1,
+                axis_detector_y: shape[axis_detector_y] + 1,
             },
         )
-
-        outputs = na.ScalarArray(images << (u.DN / u.s), axes=axes)
-
-        # Charge bleeds along the columns of the CCD
-        above = {axis_detector_y: slice(1, None)}
-        below = {axis_detector_y: slice(None, ~0)}
-        bleed = saturated.copy()
-        bleed[above] = typing.cast(na.ScalarArray, bleed[above] | saturated[below])
-        bleed[below] = typing.cast(na.ScalarArray, bleed[below] | saturated[above])
-        bleed = typing.cast(na.ScalarArray, bleed & np.isfinite(outputs))
 
         return cls(
             inputs=inputs,
             outputs=outputs,
             timedelta=timedelta,
-            saturated=bleed,
+            saturated=saturated,
             filter=filters[0],
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,

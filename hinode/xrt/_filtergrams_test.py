@@ -29,6 +29,7 @@ def _write(
     filter_2: None | str = None,
     values: None | dict[tuple[int, int], float] = None,
     image_type: None | str = None,
+    history: None | tuple[str, str] = None,
 ) -> pathlib.Path:
     """
     Write a copy of the 18:08:37 file, the one in which event E saturates,
@@ -51,6 +52,9 @@ def _write(
         and the values to give them.
     image_type
         If not :obj:`None`, the type of image the copy says it is.
+    history
+        If not :obj:`None`, a piece of text to replace in each line of the
+        history of the copy, and the text to replace it with.
     """
     path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
     data = astropy.io.fits.getdata(path)
@@ -70,6 +74,13 @@ def _write(
 
     if image_type is not None:
         header["EC_IMTY_"] = image_type
+
+    if history is not None:
+        old, new = history
+        lines = [str(line).replace(old, new) for line in header["HISTORY"]]
+        del header["HISTORY"]
+        for line in lines:
+            header.add_history(line)
 
     astropy.io.fits.writeto(file, data, header)
 
@@ -324,6 +335,51 @@ def test_saturated_dark(tmp_path: pathlib.Path) -> None:
         result.axis_detector_y: 0,
     }
     assert result.saturated[index]
+
+
+def test_saturated_level_from_history(tmp_path: pathlib.Path) -> None:
+    """The saturation level is the one the history of the file records."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    header = astropy.io.fits.getheader(path)
+    pixel = (0, 0)
+    value = 2200 / (header["EXPTIME"] * _vignetting_numpy(header)[pixel[::-1]])
+
+    def saturated(file: pathlib.Path, history: None | tuple[str, str]) -> bool:
+        _write(file, values={pixel: value}, history=history)
+        result = hinode.xrt.Filtergram.from_fits(file)
+        assert result.saturated is not None
+        index = {
+            result.axis_time: 0,
+            result.axis_detector_x: pixel[0],
+            result.axis_detector_y: pixel[1],
+        }
+        return bool(result.saturated[index])
+
+    history = ("with value = 2500", "with value = 2000")
+    assert not saturated(tmp_path / "a.fits", history=None)
+    assert saturated(tmp_path / "b.fits", history=history)
+
+
+@pytest.mark.parametrize(
+    argnames="history,match",
+    argvalues=[
+        (("--> 1.00 sec", "--> 2.00 sec"), "not in DN per second"),
+        (("(XRT_RENORMALIZE)", "(XRT_OTHER)"), "not in DN per second"),
+        (("(XRT_SATURATED_PIXELS)", "(XRT_OTHER)"), "saturated pixels"),
+    ],
+)
+def test_from_fits_history(
+    tmp_path: pathlib.Path,
+    history: tuple[str, str],
+    match: str,
+) -> None:
+    """
+    A file which ``xrt_prep`` did not normalize to DN per second,
+    or whose saturation level is not recorded, is not loaded.
+    """
+    file = _write(tmp_path / "a.fits", history=history)
+    with pytest.raises(ValueError, match=re.escape(match)):
+        hinode.xrt.Filtergram.from_fits(file)
 
 
 def test_inputs_against_astropy_wcs() -> None:
