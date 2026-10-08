@@ -1,6 +1,10 @@
+import os
 import re
+import time
 import typing
 import pathlib
+import datetime
+import tempfile
 import concurrent.futures
 import requests
 import numpy as np
@@ -40,6 +44,15 @@ The number of requests made to the archive at once,
 since most of the time of each one is spent waiting for the server.
 """
 
+_delay_retry = 1
+"""
+The number of seconds to wait before trying a request again,
+which is doubled before each further try.
+"""
+
+_signature_fits = b"SIMPLE  ="
+"""The first bytes of every FITS file."""
+
 
 def _get(
     url: str,
@@ -47,8 +60,11 @@ def _get(
     headers: None | dict[str, str] = None,
 ) -> requests.Response:
     """
-    Get a URL, trying again if the connection fails or the response is cut
-    short.
+    Get a URL, trying again if the connection fails, the server is busy or
+    has an error, or the response is cut short.
+
+    Each try waits twice as long as the one before it,
+    starting from :data:`_delay_retry`.
 
     Parameters
     ----------
@@ -63,17 +79,25 @@ def _get(
     ------
     FileNotFoundError
         If the server does not have the URL.
+    requests.exceptions.HTTPError
+        If the server refuses the request for a reason which trying again
+        cannot change, such as a 403 status.
     ConnectionError
         If no attempt succeeded.
     """
     error = None
-    for _ in range(num_retry):
+    for i in range(num_retry):
+        if i > 0:
+            time.sleep(_delay_retry * 2 ** (i - 1))
         try:
             response = requests.get(url, headers=headers, timeout=60)
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
+            status = None if e.response is None else e.response.status_code
+            if status == 404:
                 raise FileNotFoundError(url) from e
+            if status is not None and status < 500 and status != 429:
+                raise
             error = e
             continue
         except requests.exceptions.RequestException as e:  # pragma: no cover
@@ -95,18 +119,57 @@ def _get(
     raise ConnectionError(f"Could not get {url}.") from error  # pragma: no cover
 
 
+def _hours(
+    start: str | astropy.time.Time,
+    stop: str | astropy.time.Time,
+) -> list[datetime.datetime]:
+    """
+    The hours of the directories of the archive which hold the files that
+    began during a time range.
+
+    The directories are named in UTC,
+    and the hours are counted as :class:`datetime.datetime` objects,
+    which, unlike UTC times, have no leap seconds,
+    so an hour with a leap second at its end is not counted twice.
+
+    Parameters
+    ----------
+    start
+        The start of the time range.
+    stop
+        The end of the time range, which is not included.
+    """
+    format_hour = "%Y-%m-%dT%H"
+
+    def hour_utc(time: str | astropy.time.Time) -> datetime.datetime:
+        text = str(astropy.time.Time(time, scale="utc").strftime(format_hour))
+        return datetime.datetime.strptime(text, format_hour)
+
+    hour = hour_utc(start)
+    last = hour_utc(stop)
+
+    result = []
+    while hour <= last:
+        result.append(hour)
+        hour += datetime.timedelta(hours=1)
+
+    return result
+
+
 def _files(
-    hour: astropy.time.Time,
+    hour: datetime.datetime,
     num_retry: int = 5,
-) -> list[tuple[str, astropy.time.Time]]:
+) -> list[tuple[str, str]]:
     """
     The URL and the start time, from the name, of every Level 1 file in the
     directory of the archive which holds a given hour.
 
+    The start time is in UTC, in the ISOT format.
+
     Parameters
     ----------
     hour
-        A time during the hour.
+        The hour, in UTC.
     num_retry
         The number of times to try to connect to the server.
     """
@@ -119,11 +182,8 @@ def _files(
 
     result = []
     for name, date, clock in dict.fromkeys(_pattern_file.findall(response.text)):
-        time = astropy.time.Time(
-            f"{date[:4]}-{date[4:6]}-{date[6:]}T{clock[:2]}:{clock[2:4]}:{clock[4:]}",
-            scale="utc",
-        )
-        result.append((url + name, time))
+        isot = f"{date[:4]}-{date[4:6]}-{date[6:]}T{clock[:2]}:{clock[2:4]}:{clock[4:]}"
+        result.append((url + name, isot))
 
     return result
 
@@ -165,6 +225,13 @@ def _header_string(
         num_blocks *= 2
 
 
+_header_string_cached = hinode.memory.cache(_header_string, ignore=["num_retry"])
+"""
+:func:`_header_string`, cached in :data:`hinode.memory`,
+since the archive does not change.
+"""
+
+
 def _header(
     url: str,
     num_retry: int = 5,
@@ -180,8 +247,7 @@ def _header(
     num_retry
         The number of times to try to connect to the server.
     """
-    cached = hinode.memory.cache(_header_string, ignore=["num_retry"])
-    text = typing.cast(str, cached(url, num_retry))
+    text = typing.cast(str, _header_string_cached(url, num_retry))
     return astropy.io.fits.Header.fromstring(text)
 
 
@@ -217,6 +283,8 @@ def urls(
     The archive does not say which filter each image was taken through,
     so the start of each file is downloaded to read its header,
     and the headers are cached in :data:`hinode.memory`.
+    Only the images whose type, ``EC_IMTY_``, is ``normal`` are found,
+    which leaves out the dark frames.
 
     Parameters
     ----------
@@ -254,32 +322,43 @@ def urls(
     start = astropy.time.Time(time_start)
     stop = astropy.time.Time(time_stop)
 
-    hour = astropy.time.Time(start.strftime("%Y-%m-%dT%H:00:00"), scale="utc")
-
-    files = []
-    while hour < stop:
-        files += _files(hour, num_retry)
-        hour = hour + 1 * u.hour
-
-    # The name holds the start time cut to a tenth of a second,
-    # so it can be a little earlier than the start time in the header.
-    files = [url for url, time in files if start - 1 * u.s <= time < stop]
+    result: list[str] = []
 
     with concurrent.futures.ThreadPoolExecutor(_num_workers) as executor:
-        headers = list(executor.map(lambda url: _header(url, num_retry), files))
 
-    result = []
-    for url, header in zip(files, headers):
+        listings = executor.map(
+            lambda hour: _files(hour, num_retry),
+            _hours(time_start, time_stop),
+        )
+        files = dict(file for listing in listings for file in listing)
 
-        if _filter(header) != filter:
-            continue
+        # The name holds the start time cut to a tenth of a second,
+        # so it can be a little earlier than the start time in the header.
+        candidates = []
+        if files:
+            time_name = astropy.time.Time(list(files.values()), scale="utc")
+            margin = astropy.time.TimeDelta(1 * u.s)
+            where = (start - margin <= time_name) & (time_name < stop)
+            candidates = [url for url, w in zip(files, where) if w]
 
-        time = astropy.time.Time(header["DATE_OBS"], scale="utc")
+        # The first header is read before the others, so that the cache
+        # records the code of the function it caches from one thread,
+        # rather than from every thread at once.
+        headers = [_header(url, num_retry) for url in candidates[:1]]
+        headers += executor.map(lambda url: _header(url, num_retry), candidates[1:])
 
-        if start <= time < stop:
-            result.append((time, url))
+    selected = [
+        (url, header["DATE_OBS"])
+        for url, header in zip(candidates, headers)
+        if _filter(header) == filter and header.get("EC_IMTY_") == "normal"
+    ]
 
-    result = [url for time, url in sorted(result, key=lambda r: r[0].jd)]
+    if selected:
+        urls_selected, dates = zip(*selected)
+        time_header = astropy.time.Time(list(dates), scale="utc")
+        where = (start <= time_header) & (time_header < stop)
+        order = np.argsort(np.asarray(time_header.jd))
+        result = [urls_selected[i] for i in order if where[i]]
 
     return na.ScalarArray(np.array(result, dtype=str), axes=axis_time)
 
@@ -296,7 +375,8 @@ def download(
 
     The files are placed under `directory` with the same paths as on the
     server, and each one is checked against the length the server promised,
-    since the archive sometimes ends a download early.
+    since the archive sometimes ends a download early,
+    and checked to be a FITS file.
 
     Parameters
     ----------
@@ -337,20 +417,43 @@ def download(
         path = directory / "/".join(url.split("/")[3:])
 
         if overwrite or not path.exists():
-            response = _get(url, num_retry)
+            content = _get(url, num_retry).content
+
+            if not content.startswith(_signature_fits):
+                raise ValueError(
+                    f"{url} is not a FITS file, it starts with {content[:40]!r}."
+                )
+
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Written next to its final place and then moved,
+            # Written next to its final place, under a name no other download
+            # uses, and then moved,
             # so an interrupted download never looks finished.
-            partial = path.with_name(path.name + ".part")
-            partial.write_bytes(response.content)
-            partial.replace(path)
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".part",
+                delete=False,
+            ) as file:
+                file.write(content)
+            try:
+                os.replace(file.name, path)
+            except PermissionError:  # pragma: no cover
+                # Windows does not replace a file which another process has
+                # open, as it can if that process downloaded the file first.
+                os.remove(file.name)
+                if not path.exists():
+                    raise
 
         return str(path)
 
-    with concurrent.futures.ThreadPoolExecutor(_num_workers) as executor:
-        paths = list(executor.map(get, [str(url) for url in ndarray.flat]))
+    # Each URL is downloaded once, even if it is given more than once.
+    unique = list(dict.fromkeys(str(url) for url in ndarray.flat))
 
+    with concurrent.futures.ThreadPoolExecutor(_num_workers) as executor:
+        paths = dict(zip(unique, executor.map(get, unique)))
+
+    paths = [paths[str(url)] for url in ndarray.flat]
     paths = np.array(paths, dtype=str).reshape(ndarray.shape)
 
     return na.ScalarArray(paths, axes=urls.axes)

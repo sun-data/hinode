@@ -1,3 +1,4 @@
+import pathlib
 import astropy.time
 from ._filtergrams import Filtergram
 
@@ -13,6 +14,8 @@ def open(
     axis_time: str = "time",
     axis_detector_x: str = "detector_x",
     axis_detector_y: str = "detector_y",
+    directory: None | pathlib.Path = None,
+    overwrite: bool = False,
     num_retry: int = 5,
 ) -> Filtergram:
     """
@@ -38,6 +41,12 @@ def open(
         The logical axis corresponding to changes in detector :math:`x`-coordinate.
     axis_detector_y
         The logical axis corresponding to changes in detector :math:`y`-coordinate.
+    directory
+        The directory to place the downloaded files in.
+        If :obj:`None` (the default), :data:`hinode.directory_default` is used.
+    overwrite
+        Boolean flag controlling whether to download files which are already
+        in `directory`.
     num_retry
         The number of times to try to connect to the server.
     """
@@ -48,5 +57,7 @@ def open(
         axis_time=axis_time,
         axis_detector_x=axis_detector_x,
         axis_detector_y=axis_detector_y,
+        directory=directory,
+        overwrite=overwrite,
         num_retry=num_retry,
     )

@@ -1,6 +1,7 @@
 from typing import Sequence
 import typing
 import os
+import pathlib
 import dataclasses
 import numpy as np
 import astropy.units as u
@@ -22,6 +23,77 @@ _level_saturation = 2500 * u.DN
 The signal above which ``xrt_prep`` considers a pixel saturated,
 and to which it sets every saturated pixel.
 """
+
+_center_vignetting = 1024
+"""
+The column and the row of the CCD, in unsummed pixels,
+about which ``xrt_prep`` takes the vignetting to be symmetric.
+"""
+
+_plate_scale_vignetting = 1.0286 * u.arcsec
+"""
+The angle subtended by an unsummed pixel,
+as ``xrt_prep`` takes it when correcting for vignetting.
+"""
+
+_angle_graze = 0.91 * u.deg
+"""
+The average grazing angle of the mirror,
+as ``xrt_prep`` takes it when correcting for vignetting.
+"""
+
+
+def _vignetting(
+    num_x: int,
+    num_y: int,
+    chip_sum: int,
+    pos_col: int,
+    pos_row: int,
+    axis_detector_x: str,
+    axis_detector_y: str,
+) -> na.AbstractScalar:
+    """
+    The fraction of the light which reaches each pixel of an image,
+    which ``xrt_prep`` divides the image by, unless it is a dark frame.
+
+    This is a port of ``nono_vignette.pro`` in SolarSoft,
+    in which the fraction falls off linearly with the angle from the center
+    of the CCD.
+
+    Parameters
+    ----------
+    num_x
+        The number of columns of the image, ``NAXIS1``.
+    num_y
+        The number of rows of the image, ``NAXIS2``.
+    chip_sum
+        The number of pixels of the CCD summed along each axis into each
+        pixel of the image, ``CHIP_SUM``.
+    pos_col
+        The first column of the CCD in the image, in unsummed pixels,
+        ``POS_COL``.
+    pos_row
+        The first row of the CCD in the image, in unsummed pixels,
+        ``POS_ROW``.
+    axis_detector_x
+        The logical axis corresponding to changes in detector :math:`x`-coordinate.
+    axis_detector_y
+        The logical axis corresponding to changes in detector :math:`y`-coordinate.
+    """
+    # The position of the image on the CCD is divided by the summing
+    # in integer arithmetic, as ``nono_vignette.pro`` does.
+    offset_x = pos_col // chip_sum
+    offset_y = pos_row // chip_sum
+
+    x = na.arange(0, num_x, axis=axis_detector_x) + offset_x
+    y = na.arange(0, num_y, axis=axis_detector_y) + offset_y
+
+    center = _center_vignetting / chip_sum
+
+    radius = np.sqrt(np.square(x - center) + np.square(y - center))
+    angle = radius * chip_sum * _plate_scale_vignetting
+
+    return 1 - (2 / 3) * (angle / _angle_graze).to(u.dimensionless_unscaled)
 
 
 @dataclasses.dataclass(eq=False, repr=False)
@@ -109,8 +181,9 @@ class Filtergram(
 
     ``xrt_prep`` sets every pixel above the saturation level, 2500 DN,
     to exactly 2500 DN before correcting for vignetting and dividing by the
-    exposure time, so a pixel is saturated if the product of its value and
-    the exposure time is at least 2500 DN.
+    exposure time, so a pixel is saturated if the product of its value,
+    the exposure time, and the vignetting function of ``xrt_prep`` is at
+    least 2500 DN.
     The level is lowered by 0.01% to allow for the rounding of the exposure
     time in the header and of the values stored in the file.
 
@@ -144,6 +217,8 @@ class Filtergram(
         axis_time: str = "time",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
+        directory: None | pathlib.Path = None,
+        overwrite: bool = False,
         num_retry: int = 5,
     ) -> "Filtergram":
         """
@@ -166,6 +241,12 @@ class Filtergram(
             The logical axis corresponding to changes in detector :math:`x`-coordinate.
         axis_detector_y
             The logical axis corresponding to changes in detector :math:`y`-coordinate.
+        directory
+            The directory to place the downloaded files in.
+            If :obj:`None` (the default), :data:`hinode.directory_default` is used.
+        overwrite
+            Boolean flag controlling whether to download files which are already
+            in `directory`.
         num_retry
             The number of times to try to connect to the server.
         """
@@ -182,10 +263,15 @@ class Filtergram(
                 f"No {filter} images began between {time_start} and {time_stop}."
             )
 
-        paths = hinode.xrt.download(urls, num_retry=num_retry)
+        paths = hinode.xrt.download(
+            urls=urls,
+            directory=directory,
+            overwrite=overwrite,
+            num_retry=num_retry,
+        )
 
         return cls.from_fits(
-            path=[str(p) for p in np.ravel(np.asarray(paths.ndarray))],
+            path=paths,
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
@@ -194,7 +280,7 @@ class Filtergram(
     @classmethod
     def from_fits(
         cls,
-        path: str | os.PathLike | Sequence[str | os.PathLike],
+        path: str | os.PathLike | Sequence[str | os.PathLike] | na.AbstractScalarArray,
         axis_time: str = "time",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
@@ -209,7 +295,9 @@ class Filtergram(
         Parameters
         ----------
         path
-            A Level 1 XRT file, or a sequence of them.
+            A Level 1 XRT file, or a sequence of them,
+            or an array of them such as the one :func:`hinode.xrt.download`
+            returns, which is flattened.
         axis_time
             The logical axis corresponding to changes in time.
         axis_detector_x
@@ -226,7 +314,9 @@ class Filtergram(
         a ``PC`` matrix, and it is converted to one the way
         :cite:t:`Calabretta2002` describe for that older keyword.
         """
-        if isinstance(path, (str, os.PathLike)):
+        if isinstance(path, na.AbstractScalarArray):
+            path = [str(p) for p in np.ravel(np.asarray(path.ndarray))]
+        elif isinstance(path, (str, os.PathLike)):
             path = [path]
 
         if len(path) == 0:
@@ -242,12 +332,42 @@ class Filtergram(
         shape_y = max(int(h["NAXIS2"]) for h in headers)
         shape_x = max(int(h["NAXIS1"]) for h in headers)
 
+        axes = (axis_time, axis_detector_y, axis_detector_x)
+
         # Filled in place, so that the images are held in memory only once
         images = np.full((num_t, shape_y, shape_x), np.nan, dtype=np.float32)
-        for i, p in enumerate(path):
+        saturated = na.ScalarArray(np.zeros(images.shape, dtype=bool), axes=axes)
+        for i, (p, header) in enumerate(zip(path, headers)):
             data = np.asarray(astropy.io.fits.getdata(p, memmap=False))
             num_y, num_x = data.shape
             images[i, :num_y, :num_x] = data
+
+            # The signal before ``xrt_prep`` divided it by the vignetting
+            # function and by the exposure time.
+            # It is found one image at a time,
+            # so that it needs no more memory than one image.
+            image = na.ScalarArray(
+                ndarray=data << (u.DN / u.s),
+                axes=(axis_detector_y, axis_detector_x),
+            )
+            signal = image * (header["EXPTIME"] * u.s)
+            if header["EC_IMTY_"] != "dark":
+                signal = signal * _vignetting(
+                    num_x=num_x,
+                    num_y=num_y,
+                    chip_sum=int(header["CHIP_SUM"]),
+                    pos_col=int(header["POS_COL"]),
+                    pos_row=int(header["POS_ROW"]),
+                    axis_detector_x=axis_detector_x,
+                    axis_detector_y=axis_detector_y,
+                )
+
+            index = {
+                axis_time: i,
+                axis_detector_y: slice(None, num_y),
+                axis_detector_x: slice(None, num_x),
+            }
+            saturated[index] = signal >= 0.9999 * _level_saturation
 
         images[images == _value_missing] = np.nan
 
@@ -261,8 +381,7 @@ class Filtergram(
             a = [h[key] * u.Unit(h[key_unit]) for h in headers]
             return na.ScalarArray(u.Quantity(a).to(u.arcsec), axes=axis_time)
 
-        exptime = np.array([h["EXPTIME"] for h in headers], dtype=float) << u.s
-        timedelta = na.ScalarArray(exptime, axes=axis_time)
+        timedelta = scalar("EXPTIME", u.s)
 
         # Several of the headers say ``TIMESYS = 'UTC (TBR)'``
         time = astropy.time.Time([h["DATE_OBS"] for h in headers], scale="utc")
@@ -324,24 +443,21 @@ class Filtergram(
             },
         )
 
-        axes = (axis_time, axis_detector_y, axis_detector_x)
-
         outputs = na.ScalarArray(images << (u.DN / u.s), axes=axes)
 
-        signal = (images << (u.DN / u.s)) * exptime[:, np.newaxis, np.newaxis]
-        saturated = signal >= 0.9999 * _level_saturation
-
         # Charge bleeds along the columns of the CCD
+        above = {axis_detector_y: slice(1, None)}
+        below = {axis_detector_y: slice(None, ~0)}
         bleed = saturated.copy()
-        bleed[:, 1:, :] |= saturated[:, :-1, :]
-        bleed[:, :-1, :] |= saturated[:, 1:, :]
-        bleed &= np.isfinite(images)
+        bleed[above] = typing.cast(na.ScalarArray, bleed[above] | saturated[below])
+        bleed[below] = typing.cast(na.ScalarArray, bleed[below] | saturated[above])
+        bleed = typing.cast(na.ScalarArray, bleed & np.isfinite(outputs))
 
         return cls(
             inputs=inputs,
             outputs=outputs,
             timedelta=timedelta,
-            saturated=na.ScalarArray(bleed, axes=axes),
+            saturated=bleed,
             filter=filters[0],
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,

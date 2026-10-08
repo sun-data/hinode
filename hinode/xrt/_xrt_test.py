@@ -2,7 +2,7 @@ import astropy.units as u
 import hinode
 
 
-def test_open():
+def test_open() -> None:
     result = hinode.xrt.open(
         time_start="2019-09-30T18:08:30",
         time_stop="2019-09-30T18:09:00",

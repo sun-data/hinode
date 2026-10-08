@@ -8,6 +8,7 @@ import astropy.wcs
 import astropy.io.fits
 import named_arrays as na
 import hinode
+from hinode.xrt._filtergrams import _vignetting
 
 _time_start = astropy.time.Time("2019-09-30T18:08:00")
 _time_stop = astropy.time.Time("2019-09-30T18:09:00")
@@ -26,6 +27,8 @@ def _write(
     num_y: None | int = None,
     missing: None | tuple[int, int] = None,
     filter_2: None | str = None,
+    values: None | dict[tuple[int, int], float] = None,
+    image_type: None | str = None,
 ) -> pathlib.Path:
     """
     Write a copy of the 18:08:37 file, the one in which event E saturates,
@@ -43,6 +46,11 @@ def _write(
         If not :obj:`None`, the column and row of a pixel to mark as missing.
     filter_2
         If not :obj:`None`, the filter the copy says is in the second wheel.
+    values
+        If not :obj:`None`, the column and row of pixels,
+        and the values to give them.
+    image_type
+        If not :obj:`None`, the type of image the copy says it is.
     """
     path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
     data = astropy.io.fits.getdata(path)
@@ -51,14 +59,43 @@ def _write(
     if missing is not None:
         data[missing[1], missing[0]] = -999
 
+    if values is not None:
+        for (column, row), value in values.items():
+            data[row, column] = value
+
     data = data[:num_y, :num_x]
 
     if filter_2 is not None:
         header["EC_FW2_"] = filter_2
 
+    if image_type is not None:
+        header["EC_IMTY_"] = image_type
+
     astropy.io.fits.writeto(file, data, header)
 
     return file
+
+
+def _vignetting_numpy(header: astropy.io.fits.Header) -> np.ndarray:
+    """
+    The vignetting function of ``xrt_prep``, indexed by row and column,
+    following ``nono_vignette.pro`` line by line.
+    """
+    num_x = header["NAXIS1"]
+    num_y = header["NAXIS2"]
+    chip_sum = header["CHIP_SUM"]
+
+    x = np.arange(num_x, dtype=float)[np.newaxis, :] + header["POS_COL"] // chip_sum
+    y = np.arange(num_y, dtype=float)[:, np.newaxis] + header["POS_ROW"] // chip_sum
+
+    x0 = 1024 / chip_sum
+    y0 = 1024 / chip_sum
+    arcsec_per_pix = 1.0286 * chip_sum
+    graze_angle = 0.91 * 60
+
+    angle = np.sqrt((x - x0) ** 2 + (y - y0) ** 2) * arcsec_per_pix / 60
+
+    return 1 - (2 / 3) * (angle / graze_angle)
 
 
 def _num_saturated(header: astropy.io.fits.Header) -> int:
@@ -88,37 +125,37 @@ def _num_saturated(header: astropy.io.fits.Header) -> int:
 )
 class TestFiltergram:
 
-    def test_axes(self, array: hinode.xrt.Filtergram):
+    def test_axes(self, array: hinode.xrt.Filtergram) -> None:
         axes = {array.axis_time, array.axis_detector_x, array.axis_detector_y}
         assert set(array.outputs.shape) == axes
         assert set(array.inputs.crpix.components) == axes - {array.axis_time}
         assert set(array.inputs.pc.position.x.components) == axes - {array.axis_time}
         assert set(array.inputs.pc.position.y.components) == axes - {array.axis_time}
 
-    def test_shape(self, array: hinode.xrt.Filtergram):
+    def test_shape(self, array: hinode.xrt.Filtergram) -> None:
         assert array.shape[array.axis_time] == 4
         assert array.shape[array.axis_detector_x] == 384
         assert array.shape[array.axis_detector_y] == 384
 
-    def test_time(self, array: hinode.xrt.Filtergram):
+    def test_time(self, array: hinode.xrt.Filtergram) -> None:
         time = array.inputs.time
         assert time.shape == {array.axis_time: array.shape[array.axis_time]}
         assert np.all(time.ndarray >= _time_start)
         assert np.all(time.ndarray < _time_stop)
         assert np.all(np.diff(time.ndarray.jd) > 0)
 
-    def test_timedelta(self, array: hinode.xrt.Filtergram):
+    def test_timedelta(self, array: hinode.xrt.Filtergram) -> None:
         timedelta = array.timedelta
         assert timedelta.shape == {array.axis_time: array.shape[array.axis_time]}
         assert np.all(timedelta > 10 * u.s)
 
-    def test_outputs(self, array: hinode.xrt.Filtergram):
+    def test_outputs(self, array: hinode.xrt.Filtergram) -> None:
         outputs = array.outputs
         assert outputs.unit == u.DN / u.s
         assert not np.any(outputs == -999 * u.DN / u.s)
         assert np.nanmedian(outputs) > 0 * u.DN / u.s
 
-    def test_saturated(self, array: hinode.xrt.Filtergram):
+    def test_saturated(self, array: hinode.xrt.Filtergram) -> None:
         saturated = array.saturated
         assert isinstance(saturated, na.ScalarArray)
         assert saturated.ndarray.dtype == bool
@@ -128,10 +165,10 @@ class TestFiltergram:
         num = saturated.sum(axis=(array.axis_detector_x, array.axis_detector_y))
         assert np.all(num.ndarray == [0, 6, 3, 0])
 
-    def test_filter(self, array: hinode.xrt.Filtergram):
+    def test_filter(self, array: hinode.xrt.Filtergram) -> None:
         assert array.filter == "Al_poly"
 
-    def test_getitem(self, array: hinode.xrt.Filtergram):
+    def test_getitem(self, array: hinode.xrt.Filtergram) -> None:
         index = {array.axis_time: 1}
         result = array[index]
         assert isinstance(result, hinode.xrt.Filtergram)
@@ -150,7 +187,7 @@ class TestFiltergram:
         ("2019-09-30T18:10:10", "2019-09-30T18:10:20"),
     ],
 )
-def test_saturated_against_history(time_start: str, time_stop: str):
+def test_saturated_against_history(time_start: str, time_stop: str) -> None:
     """
     The saturated pixels are the ones ``xrt_prep`` says it found,
     and the pixels just above and below them.
@@ -162,8 +199,12 @@ def test_saturated_against_history(time_start: str, time_stop: str):
     header = astropy.io.fits.getheader(path)
     data = astropy.io.fits.getdata(path)
 
-    saturated = data * header["EXPTIME"] >= 0.9999 * 2500
+    signal = data * header["EXPTIME"] * _vignetting_numpy(header)
+
+    # ``xrt_prep`` set the saturated pixels to exactly the saturation level
+    saturated = signal >= 0.9999 * 2500
     assert np.sum(saturated) == _num_saturated(header) > 0
+    assert np.allclose(signal[saturated], 2500, rtol=1e-5)
 
     expected = saturated.copy()
     expected[1:] |= saturated[:-1]
@@ -173,7 +214,119 @@ def test_saturated_against_history(time_start: str, time_stop: str):
     assert np.all(result.saturated.ndarray[0] == expected)
 
 
-def test_inputs_against_astropy_wcs():
+@pytest.mark.parametrize(
+    argnames="chip_sum,pos_col,pos_row",
+    argvalues=[
+        (1, 872, 856),
+        (2, 3, 1),
+        (4, 0, 2047),
+    ],
+)
+def test_vignetting(
+    chip_sum: int,
+    pos_col: int,
+    pos_row: int,
+) -> None:
+    header = astropy.io.fits.Header()
+    header["NAXIS1"] = 7
+    header["NAXIS2"] = 5
+    header["CHIP_SUM"] = chip_sum
+    header["POS_COL"] = pos_col
+    header["POS_ROW"] = pos_row
+
+    result = _vignetting(
+        num_x=7,
+        num_y=5,
+        chip_sum=chip_sum,
+        pos_col=pos_col,
+        pos_row=pos_row,
+        axis_detector_x="x",
+        axis_detector_y="y",
+    )
+
+    expected = _vignetting_numpy(header)
+
+    assert result.shape == {"x": 7, "y": 5}
+    assert np.allclose(result.ndarray_aligned(("y", "x")), expected, rtol=1e-12)
+
+
+def test_vignetting_center() -> None:
+    """The light is not vignetted at the center of the CCD."""
+    result = _vignetting(
+        num_x=3,
+        num_y=3,
+        chip_sum=1,
+        pos_col=1023,
+        pos_row=1023,
+        axis_detector_x="x",
+        axis_detector_y="y",
+    )
+
+    assert result[dict(x=1, y=1)] == 1
+    assert result[dict(x=0, y=1)] < 1
+
+
+def test_saturated_vignetting(tmp_path: pathlib.Path) -> None:
+    """
+    A pixel is saturated if its value is the saturation level once the
+    vignetting correction and the exposure time are taken out of it,
+    not if its value alone, times the exposure time, is above the level.
+    """
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    header = astropy.io.fits.getheader(path)
+    exptime = header["EXPTIME"]
+    vignetting = _vignetting_numpy(header)
+
+    # Two corners, far from the center of the CCD and from event E
+    saturated = (0, 0)
+    bright = (383, 383)
+
+    level_saturated = 2500 / (exptime * vignetting[saturated[1], saturated[0]])
+    level_bright = 0.999 * 2500 / (exptime * vignetting[bright[1], bright[0]])
+
+    # Without the vignetting, the bright pixel would seem saturated
+    assert level_bright * exptime > 2500
+
+    file = _write(
+        file=tmp_path / "a.fits",
+        values={saturated: level_saturated, bright: level_bright},
+    )
+
+    result = hinode.xrt.Filtergram.from_fits(file)
+
+    assert result.saturated is not None
+    axis_x = result.axis_detector_x
+    axis_y = result.axis_detector_y
+    index = {result.axis_time: 0}
+
+    assert result.saturated[index | {axis_x: saturated[0], axis_y: saturated[1]}]
+    assert result.saturated[index | {axis_x: saturated[0], axis_y: saturated[1] + 1}]
+    assert not result.saturated[index | {axis_x: bright[0], axis_y: bright[1]}]
+
+
+def test_saturated_dark(tmp_path: pathlib.Path) -> None:
+    """``xrt_prep`` does not correct a dark frame for vignetting."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    exptime = astropy.io.fits.getheader(path)["EXPTIME"]
+
+    file = _write(
+        file=tmp_path / "a.fits",
+        values={(0, 0): 2500 / exptime},
+        image_type="dark",
+    )
+
+    result = hinode.xrt.Filtergram.from_fits(file)
+
+    assert result.saturated is not None
+    index = {
+        result.axis_time: 0,
+        result.axis_detector_x: 0,
+        result.axis_detector_y: 0,
+    }
+    assert result.saturated[index]
+
+
+def test_inputs_against_astropy_wcs() -> None:
     """
     The coordinates of each pixel must be the ones :mod:`astropy.wcs`
     makes of the header, which gives the roll as ``CROTA2``.
@@ -211,7 +364,7 @@ def test_inputs_against_astropy_wcs():
         assert np.isclose(position.y[index].ndarray, expected[1], rtol=1e-10)
 
 
-def test_from_fits_missing(tmp_path: pathlib.Path):
+def test_from_fits_missing(tmp_path: pathlib.Path) -> None:
     path = _write(tmp_path / "a.fits", missing=(10, 20))
 
     result = hinode.xrt.Filtergram.from_fits(path)
@@ -227,7 +380,7 @@ def test_from_fits_missing(tmp_path: pathlib.Path):
     assert np.sum(np.isnan(result.outputs)) == 1
 
 
-def test_from_fits_concatenate(tmp_path: pathlib.Path):
+def test_from_fits_concatenate(tmp_path: pathlib.Path) -> None:
     a = _write(tmp_path / "a.fits", num_x=300, num_y=200)
     b = _write(tmp_path / "b.fits", num_x=100, num_y=384)
 
@@ -253,7 +406,7 @@ def test_from_fits_concatenate(tmp_path: pathlib.Path):
     assert np.all(result.outputs[{axis_t: 1, axis_x: slice(None, 100)}] == image_b)
 
 
-def test_from_fits_different_filters(tmp_path: pathlib.Path):
+def test_from_fits_different_filters(tmp_path: pathlib.Path) -> None:
     a = _write(tmp_path / "a.fits")
     b = _write(tmp_path / "b.fits", filter_2="Ti_poly")
 
@@ -261,12 +414,47 @@ def test_from_fits_different_filters(tmp_path: pathlib.Path):
         hinode.xrt.Filtergram.from_fits([a, b])
 
 
-def test_from_fits_no_files():
+def test_from_fits_no_files() -> None:
     with pytest.raises(ValueError, match="No files"):
         hinode.xrt.Filtergram.from_fits([])
 
 
-def test_from_time_range_no_images():
+def test_from_fits_array() -> None:
+    """The array of paths that :func:`hinode.xrt.download` returns is accepted."""
+    urls = hinode.xrt.urls(_time_start, _time_stop)
+    paths = hinode.xrt.download(urls)
+
+    result = hinode.xrt.Filtergram.from_fits(paths)
+    expected = hinode.xrt.Filtergram.from_fits(list(paths.ndarray))
+
+    assert result.shape == expected.shape
+    assert np.all(result.outputs == expected.outputs)
+
+
+def test_from_time_range_directory(tmp_path: pathlib.Path) -> None:
+    """The images are downloaded into the given directory."""
+    kwargs = dict(
+        time_start="2019-09-30T18:08:30",
+        time_stop="2019-09-30T18:08:40",
+        directory=tmp_path,
+    )
+
+    result = hinode.xrt.Filtergram.from_time_range(**kwargs)
+
+    (file,) = tmp_path.rglob("*.fits")
+    mtime = file.stat().st_mtime_ns
+
+    assert result.shape[result.axis_time] == 1
+
+    # The file is downloaded again only if asked to be
+    hinode.xrt.Filtergram.from_time_range(**kwargs)
+    assert file.stat().st_mtime_ns == mtime
+
+    hinode.xrt.Filtergram.from_time_range(**kwargs, overwrite=True)
+    assert file.stat().st_mtime_ns != mtime
+
+
+def test_from_time_range_no_images() -> None:
     with pytest.raises(ValueError, match="No Al_poly images"):
         hinode.xrt.Filtergram.from_time_range(
             time_start="2019-09-30T18:08:01",
