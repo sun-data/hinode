@@ -76,6 +76,38 @@ EUV Snapshot Imaging Spectrograph (ESIS) was observing the Sun on
         ax.set_ylabel(f"helioprojective $y$ ({unit:latex_inline})")
 
 
+Citation
+========
+
+If you use :mod:`hinode` in your research, please cite it.
+The citation metadata is kept in
+`CITATION.cff <https://github.com/sun-data/hinode/blob/main/CITATION.cff>`_,
+which the "Cite this repository" button on the
+`GitHub page <https://github.com/sun-data/hinode>`_
+can export as BibTeX or APA.
+
+Every release of :mod:`hinode` is archived on Zenodo with its own DOI.
+The concept DOI,
+`10.5281/zenodo.23249959 <https://doi.org/10.5281/zenodo.23249959>`_,
+always resolves to the latest version,
+and the Zenodo page lists the DOI of every version.
+Please include the version of :mod:`hinode` that you used,
+which is given by ``importlib.metadata.version("hinode")``.
+The BibTeX entry below uses the concept DOI.
+To cite a specific version instead,
+replace ``doi`` with the DOI of that version.
+
+.. code-block:: bibtex
+
+    @software{hinode,
+      author = {Smart, Roy T.},
+      title = {hinode},
+      version = {X.Y.Z},
+      doi = {10.5281/zenodo.23249959},
+      url = {https://github.com/sun-data/hinode},
+    }
+
+
 References
 ==========
 
