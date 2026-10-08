@@ -6,6 +6,8 @@
 [![Ruff](https://github.com/sun-data/hinode/actions/workflows/ruff.yml/badge.svg)](https://github.com/sun-data/hinode/actions/workflows/ruff.yml)
 [![typing](https://github.com/sun-data/hinode/actions/workflows/typing.yml/badge.svg)](https://github.com/sun-data/hinode/actions/workflows/typing.yml)
 [![Documentation Status](https://readthedocs.org/projects/hinode/badge/?version=latest)](https://hinode.readthedocs.io/en/latest/?badge=latest)
+[![PyPI version](https://badge.fury.io/py/hinode.svg)](https://badge.fury.io/py/hinode)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23249959.svg)](https://doi.org/10.5281/zenodo.23249959)
 
 A Python library to download and analyze observations from the
 JAXA/NASA [Hinode](https://hinode.nao.ac.jp/en/) satellite.
@@ -44,3 +46,23 @@ images = hinode.xrt.open(
 If you use hinode in your research, please cite it.
 The citation metadata is kept in [`CITATION.cff`](https://github.com/sun-data/hinode/blob/main/CITATION.cff),
 which the "Cite this repository" button on GitHub can export as BibTeX or APA.
+
+Every release of hinode is archived on Zenodo with its own DOI.
+The concept DOI, [10.5281/zenodo.23249959](https://doi.org/10.5281/zenodo.23249959),
+always resolves to the latest version,
+and the Zenodo page lists the DOI of every version.
+Please include the version of hinode that you used,
+which is given by `importlib.metadata.version("hinode")`.
+The BibTeX entry below uses the concept DOI.
+To cite a specific version instead,
+replace `doi` with the DOI of that version.
+
+```bibtex
+@software{hinode,
+  author = {Smart, Roy T.},
+  title = {hinode},
+  version = {X.Y.Z},
+  doi = {10.5281/zenodo.23249959},
+  url = {https://github.com/sun-data/hinode},
+}
+```
