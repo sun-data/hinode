@@ -319,6 +319,20 @@ def _filter(header: astropy.io.fits.Header) -> str:
     return "/".join(names)
 
 
+def _history(header: astropy.io.fits.Header) -> str:
+    """
+    The ``HISTORY`` of a header as one string,
+    with the lines which continue an entry joined to it.
+
+    Parameters
+    ----------
+    header
+        The primary header of an XRT file.
+    """
+    lines = [str(line) for line in header.get("HISTORY") or []]
+    return " ".join(line.removeprefix("(cont'd) ") for line in lines)
+
+
 def urls(
     time_start: str | astropy.time.Time,
     time_stop: str | astropy.time.Time,

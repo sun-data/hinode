@@ -10,7 +10,9 @@ import astropy.time
 import astropy.io.fits
 import named_arrays as na
 import hinode
-from ._data import _filter
+from ._data import _filter, _history
+from ._leak import _leak
+from ._uncertainty import _quality, _error_jpeg, _error_dark, _error_vignetting
 
 __all__ = [
     "Filtergram",
@@ -109,20 +111,6 @@ def _vignetting(
     return 1 - (2 / 3) * (angle / _angle_graze).to(u.dimensionless_unscaled)
 
 
-def _history(header: astropy.io.fits.Header) -> str:
-    """
-    The ``HISTORY`` of a header as one string,
-    with the lines which continue an entry joined to it.
-
-    Parameters
-    ----------
-    header
-        The primary header of an XRT file.
-    """
-    lines = [str(line) for line in header.get("HISTORY") or []]
-    return " ".join(line.removeprefix("(cont'd) ") for line in lines)
-
-
 def _check_normalized(
     header: astropy.io.fits.Header,
     path: str | os.PathLike,
@@ -206,6 +194,11 @@ class Filtergram(
     ``DATE_OBS``, as in the other sun-data packages,
     so the middle of each exposure is ``inputs.time + timedelta / 2``.
 
+    Since 2012, visible light has leaked into XRT, which ``xrt_prep`` does
+    not subtract.
+    Load it with ``leak=True`` and subtract it with :meth:`remove_leak`.
+    The uncertainty of each pixel is found with :meth:`uncertainty`.
+
     Examples
     --------
 
@@ -283,6 +276,54 @@ class Filtergram(
     are marked as well.
     """
 
+    vignetting: None | na.ScalarArray = None
+    """
+    The fraction of the light which reaches each pixel,
+    which ``xrt_prep`` divided each image by,
+    from the model of ``nono_vignette.pro`` in SolarSoft,
+    or 1 for a dark frame, which ``xrt_prep`` does not correct for vignetting.
+    """
+
+    uncertainty_map: None | na.ScalarArray = None
+    """
+    The uncertainty of each pixel due to the camera and to the processing of
+    the image, in DN per second,
+    as the uncertainty map of ``xrt_prep``, ``uncert_map``, gives it
+    :cite:p:`Kobelski2014`:
+    the error of the JPEG compression, of the dark subtraction,
+    and of the vignetting correction.
+
+    It does not include the photon noise, which depends on the spectrum of
+    the plasma, so the whole uncertainty is found with :meth:`uncertainty`.
+
+    ``xrt_prep`` finds the error of the JPEG compression from the range of
+    the signal of the Level 0 image in each block of 8 by 8 pixels.
+    Here the signal is found from the Level 1 image instead,
+    by undoing the vignetting correction and the division by the exposure
+    time.
+    ``xrt_prep`` also includes an empirical model of the error of its Fourier
+    filtering of the read-out noise, which is left out here.
+    """
+
+    leak: None | na.ScalarArray = None
+    """
+    The visible light which leaks into each pixel, in DN per second,
+    or :obj:`None` if the leak was not loaded.
+
+    Since the entrance filters of XRT began to tear in 2012,
+    visible light has leaked into the X-ray filters :cite:p:`Takeda2016`.
+    The leak is found from the image of the leak SolarSoft has for the
+    filter and the stray-light phase of each image,
+    which ``xrt_synleaksub.pro`` selects,
+    cut out and resampled to the part of the CCD each image covers.
+    Before the first tear, on 2012 May 9, the leak is zero.
+
+    The images of the leak were taken with Hinode pointed near the center
+    of the Sun, and the pattern of the leak changes with the pointing,
+    so it is most reliable for images near the center of the Sun.
+    It also varies by about 10% with the contamination of the CCD.
+    """
+
     filter: None | str = None
     """
     The filters the images were taken through,
@@ -310,6 +351,7 @@ class Filtergram(
         directory: None | pathlib.Path = None,
         overwrite: bool = False,
         num_retry: int = 5,
+        leak: bool = False,
     ) -> "Filtergram":
         """
         Download the Level 1 images which began during a given time range
@@ -339,6 +381,9 @@ class Filtergram(
             in `directory`.
         num_retry
             The number of times to try to connect to the server.
+        leak
+            Whether to load the visible light leaking into each pixel,
+            :attr:`leak`.
         """
         urls = hinode.xrt.urls(
             time_start=time_start,
@@ -365,6 +410,8 @@ class Filtergram(
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
+            leak=leak,
+            directory=directory,
         )
 
     @classmethod
@@ -374,6 +421,8 @@ class Filtergram(
         axis_time: str = "time",
         axis_detector_x: str = "detector_x",
         axis_detector_y: str = "detector_y",
+        leak: bool = False,
+        directory: None | pathlib.Path = None,
     ) -> "Filtergram":
         """
         Load one or more Level 1 XRT files taken through the same filter.
@@ -394,14 +443,22 @@ class Filtergram(
             The logical axis corresponding to changes in detector :math:`x`-coordinate.
         axis_detector_y
             The logical axis corresponding to changes in detector :math:`y`-coordinate.
+        leak
+            Whether to load the visible light leaking into each pixel,
+            :attr:`leak`, from SolarSoft.
+        directory
+            The directory to place the downloaded images of the leak in.
+            If :obj:`None` (the default), :data:`hinode.directory_default` is used.
 
         Raises
         ------
         ValueError
             If ``xrt_prep`` did not divide an image by its exposure time,
             which it does only if asked to with its ``/normalize`` keyword,
-            or if the history of a file does not record the value
-            ``xrt_prep`` set the saturated pixels to.
+            if the history of a file does not record the value
+            ``xrt_prep`` set the saturated pixels to,
+            or if `leak` is :obj:`True` and SolarSoft has no image of the leak
+            for the filter and the time of an image.
 
         Notes
         -----
@@ -444,6 +501,13 @@ class Filtergram(
         outputs = na.ScalarArray.full(shape, np.nan, dtype=np.float32) << unit_outputs
         outputs = typing.cast(na.ScalarArray, outputs)
         saturated = na.ScalarArray.zeros(shape, dtype=bool)
+        vignetting = na.ScalarArray.full(shape, np.nan, dtype=np.float32)
+        uncertainty_map = na.ScalarArray.full(shape, np.nan, dtype=np.float32)
+        uncertainty_map = typing.cast(na.ScalarArray, uncertainty_map << unit_outputs)
+        leaks = None
+        if leak:
+            leaks = na.ScalarArray.full(shape, np.nan, dtype=np.float32)
+            leaks = typing.cast(na.ScalarArray, leaks << unit_outputs)
 
         # Charge bleeds along the columns of the CCD
         above = {axis_detector_y: slice(1, None)}
@@ -461,19 +525,37 @@ class Filtergram(
             num_x = image.shape[axis_detector_x]
             num_y = image.shape[axis_detector_y]
 
-            # The signal before ``xrt_prep`` divided it by the vignetting
-            # function and by the exposure time.
-            signal = image * (header["EXPTIME"] * u.s)
+            chip_sum = int(header["CHIP_SUM"])
+
+            vignetting_image: float | na.ScalarArray = 1.0
+            error_vignetting: float | na.ScalarArray = 0.0
             if header["EC_IMTY_"] != "dark":
-                signal = signal * _vignetting(
+                vignetting_image = typing.cast(
+                    na.ScalarArray,
+                    _vignetting(
+                        num_x=num_x,
+                        num_y=num_y,
+                        chip_sum=chip_sum,
+                        pos_col=int(header["POS_COL"]),
+                        pos_row=int(header["POS_ROW"]),
+                        axis_detector_x=axis_detector_x,
+                        axis_detector_y=axis_detector_y,
+                    ),
+                )
+                error_vignetting = _error_vignetting(
                     num_x=num_x,
                     num_y=num_y,
-                    chip_sum=int(header["CHIP_SUM"]),
-                    pos_col=int(header["POS_COL"]),
-                    pos_row=int(header["POS_ROW"]),
+                    chip_sum=chip_sum,
+                    p1_col=int(header["P1COL"]),
+                    p1_row=int(header["P1ROW"]),
                     axis_detector_x=axis_detector_x,
                     axis_detector_y=axis_detector_y,
                 )
+
+            # The signal before ``xrt_prep`` divided it by the vignetting
+            # function and by the exposure time.
+            exposure = header["EXPTIME"] * u.s
+            signal = typing.cast(na.ScalarArray, image * exposure * vignetting_image)
 
             saturated_image = typing.cast(na.ScalarArray, signal >= 0.9999 * level)
             bleed = saturated_image.copy()
@@ -491,6 +573,46 @@ class Filtergram(
             }
             outputs[index] = image
             saturated[index] = bleed & np.isfinite(image)
+            vignetting[index] = vignetting_image
+
+            # The errors of the camera are in DN of the signal,
+            # before the vignetting correction and the normalization.
+            quality = _quality(
+                compression=int(header["IMGCOMP1"]),
+                table=int(header["QTABLE1"]),
+            )
+            error_jpeg = _error_jpeg(
+                signal=signal,
+                quality=quality,
+                axis_detector_x=axis_detector_x,
+                axis_detector_y=axis_detector_y,
+            )
+            error_dark = _error_dark(
+                history=_history(header),
+                chip_sum=chip_sum,
+                num_x=num_x,
+                num_y=num_y,
+                quality=quality,
+            )
+            error_camera = np.sqrt(np.square(error_jpeg) + np.square(error_dark))
+            uncertainty_map[index] = np.sqrt(
+                np.square(error_camera / (vignetting_image * exposure))
+                + np.square(error_vignetting * image)
+            )
+
+            if leaks is not None:
+                leaks[index] = _leak(
+                    filter=filters[0],
+                    time=astropy.time.Time(header["DATE_OBS"], scale="utc"),
+                    num_x=num_x,
+                    num_y=num_y,
+                    chip_sum=chip_sum,
+                    pos_col=int(header["POS_COL"]),
+                    pos_row=int(header["POS_ROW"]),
+                    axis_detector_x=axis_detector_x,
+                    axis_detector_y=axis_detector_y,
+                    directory=directory,
+                )
 
         def scalar(key: str, unit: u.UnitBase | None = None) -> na.ScalarArray:
             a = np.array([h[key] for h in headers], dtype=float)
@@ -569,8 +691,146 @@ class Filtergram(
             outputs=outputs,
             timedelta=timedelta,
             saturated=saturated,
+            vignetting=vignetting,
+            uncertainty_map=uncertainty_map,
+            leak=leaks,
             filter=filters[0],
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,
         )
+
+    def remove_leak(
+        self,
+        scale: float = 1,
+    ) -> "Filtergram":
+        """
+        Subtract the visible light leaking into each pixel, :attr:`leak`,
+        from the images, as ``xrt_synleaksub.pro`` in SolarSoft does.
+
+        :attr:`leak` is kept, so subtracting it again would subtract it twice.
+
+        Parameters
+        ----------
+        scale
+            The factor to multiply the leak by before subtracting it,
+            ``kfact`` in ``xrt_synleaksub.pro``.
+
+        Examples
+        --------
+
+        The median signal of the Al_poly images captured while ESIS was
+        observing the Sun, before and after the leak is subtracted.
+
+        .. jupyter-execute::
+
+            import hinode
+
+            images = hinode.xrt.open(
+                time_start="2019-09-30T18:06:11",
+                time_stop="2019-09-30T18:11:01",
+                leak=True,
+            )
+
+            axes = (images.axis_detector_x, images.axis_detector_y)
+
+            print(images.outputs.median(axes))
+            print(images.remove_leak().outputs.median(axes))
+        """
+        if self.leak is None:
+            raise ValueError(
+                "The leak was not loaded, so it cannot be removed. "
+                "Load the images with `leak=True`."
+            )
+
+        outputs = typing.cast(na.ScalarArray, self.outputs - scale * self.leak)
+
+        return dataclasses.replace(self, outputs=outputs)
+
+    def uncertainty(
+        self,
+        dn_per_photon: u.Quantity | na.AbstractScalar,
+    ) -> na.ScalarArray:
+        r"""
+        The one-sigma uncertainty of each pixel, in DN per second.
+
+        This is the photon noise of the signal combined with the uncertainty
+        due to the camera and the processing of the image,
+        :attr:`uncertainty_map`,
+
+        .. math::
+
+            \sigma^2 = \frac{g \max(I, 0)}{V t} + \sigma_\text{map}^2,
+
+        where :math:`I` is the signal of the pixel, :attr:`outputs`,
+        :math:`g` is the average signal of one photon,
+        :math:`V` is the vignetting, :attr:`vignetting`,
+        and :math:`t` is the exposure time, :attr:`timedelta`
+        :cite:p:`Kobelski2014`.
+
+        The average signal of one photon depends on the spectrum,
+        so it is given.
+        For plasma at one temperature it is the ratio of the
+        temperature response of :func:`hinode.xrt.temperature_response` in DN
+        to that in photons,
+        and for a differential emission measure (DEM) it is the ratio of the
+        two responses weighted by the DEM.
+        Subtract the leak first, with :meth:`remove_leak`,
+        since visible photons give much less signal each than X-rays.
+
+        Parameters
+        ----------
+        dn_per_photon
+            The average signal of one photon absorbed by the CCD,
+            in DN per photon, which may vary from pixel to pixel.
+
+        Examples
+        --------
+
+        The median relative uncertainty of the Al_poly images captured while
+        ESIS was observing the Sun,
+        with the signal of one photon of plasma at 2 MK.
+
+        .. jupyter-execute::
+
+            import numpy as np
+            import astropy.units as u
+            import hinode
+
+            images = hinode.xrt.open(
+                time_start="2019-09-30T18:06:11",
+                time_stop="2019-09-30T18:11:01",
+                leak=True,
+            ).remove_leak()
+
+            time = images.inputs.time.ndarray[0]
+            response = hinode.xrt.temperature_response("Al_poly", time)
+            photons = hinode.xrt.temperature_response("Al_poly", time, photons=True)
+
+            # The temperature closest to 2 MK
+            index = dict(
+                filter=0,
+                temperature=int(np.argmin(np.abs(response.inputs.ndarray - 2 * u.MK))),
+            )
+            dn_per_photon = (response.outputs / photons.outputs)[index]
+
+            uncertainty = images.uncertainty(dn_per_photon)
+
+            axes = (images.axis_detector_x, images.axis_detector_y)
+            (uncertainty / images.outputs).median(axes)
+        """
+        if self.vignetting is None or self.uncertainty_map is None:
+            raise ValueError(
+                "The vignetting and the uncertainty map are needed, "
+                "which `from_fits` loads."
+            )
+
+        # A negative signal, which the read-out noise and the subtraction of
+        # the leak leave in faint pixels, has no photon noise.
+        signal = (self.outputs.value > 0) * self.outputs
+        gain = na.as_named_array(dn_per_photon) * u.ph
+
+        variance = signal * gain / (self.vignetting * self.timedelta)
+        variance = variance + np.square(self.uncertainty_map)
+
+        return typing.cast(na.ScalarArray, np.sqrt(variance))

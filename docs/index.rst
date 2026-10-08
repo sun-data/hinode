@@ -9,7 +9,14 @@ This Python package downloads Hinode observations and represents them
 using :mod:`named_arrays`,
 a named tensor implementation with :class:`astropy.units.Quantity` support.
 So far it supports the Level 1 images of the
-X-Ray Telescope (XRT) :cite:p:`Golub2007`, in :mod:`hinode.xrt`.
+X-Ray Telescope (XRT) :cite:p:`Golub2007`, in :mod:`hinode.xrt`,
+along with what a differential emission measure needs:
+the temperature response of each filter,
+:func:`hinode.xrt.temperature_response`,
+the visible light leaking into each pixel,
+:attr:`hinode.xrt.Filtergram.leak`,
+and the uncertainty of each pixel,
+:meth:`hinode.xrt.Filtergram.uncertainty`.
 
 Installation
 ============

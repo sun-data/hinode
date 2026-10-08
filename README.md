@@ -20,6 +20,9 @@ The images are not represented as instances of
 but as instances of [`named_arrays.FunctionArray`](https://named-arrays.readthedocs.io/en/latest/_autosummary/named_arrays.FunctionArray.html),
 which carry the time, exposure time and sky position of every pixel,
 along with a mask of the pixels affected by saturation.
+It also computes what a differential emission measure needs:
+the temperature response of each filter, using [xrtpy](https://xrtpy.readthedocs.io),
+the visible light leaking into each pixel, and the uncertainty of each pixel.
 
 ## Installation
 

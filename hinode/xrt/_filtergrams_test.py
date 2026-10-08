@@ -131,6 +131,7 @@ def _num_saturated(header: astropy.io.fits.Header) -> int:
             axis_time="t",
             axis_detector_x="x",
             axis_detector_y="y",
+            leak=True,
         ),
     ],
 )
@@ -179,6 +180,31 @@ class TestFiltergram:
     def test_filter(self, array: hinode.xrt.Filtergram) -> None:
         assert array.filter == "Al_poly"
 
+    def test_vignetting(self, array: hinode.xrt.Filtergram) -> None:
+        vignetting = array.vignetting
+        assert isinstance(vignetting, na.ScalarArray)
+        assert vignetting.shape == array.outputs.shape
+        assert np.all((0.9 < vignetting) & (vignetting <= 1))
+
+    def test_uncertainty_map(self, array: hinode.xrt.Filtergram) -> None:
+        uncertainty_map = array.uncertainty_map
+        assert isinstance(uncertainty_map, na.ScalarArray)
+        assert uncertainty_map.shape == array.outputs.shape
+        assert uncertainty_map.unit == u.DN / u.s
+
+        # Mostly the JPEG and dark errors, about 2 to 3 DN in 16 s
+        median = np.median(uncertainty_map)
+        assert 0.1 * u.DN / u.s < median < 0.2 * u.DN / u.s
+
+    def test_leak(self, array: hinode.xrt.Filtergram) -> None:
+        if array.leak is None:
+            with pytest.raises(ValueError, match="not loaded"):
+                array.remove_leak()
+            return
+        assert array.leak.shape == array.outputs.shape
+        assert np.all(0.7 * u.DN / u.s < array.leak)
+        assert np.all(array.leak < 1.1 * u.DN / u.s)
+
     def test_getitem(self, array: hinode.xrt.Filtergram) -> None:
         index = {array.axis_time: 1}
         result = array[index]
@@ -188,6 +214,10 @@ class TestFiltergram:
         assert result.saturated is not None
         assert array.saturated is not None
         assert np.all(result.saturated == array.saturated[index])
+        for name in ["vignetting", "uncertainty_map", "leak"]:
+            field = getattr(array, name)
+            if field is not None:
+                assert np.all(getattr(result, name) == field[index])
 
 
 @pytest.mark.parametrize(
@@ -335,6 +365,105 @@ def test_saturated_dark(tmp_path: pathlib.Path) -> None:
         result.axis_detector_y: 0,
     }
     assert result.saturated[index]
+
+
+def test_vignetting_field() -> None:
+    """The vignetting of each pixel is the model of ``xrt_prep``."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    header = astropy.io.fits.getheader(path)
+
+    result = hinode.xrt.Filtergram.from_fits(path)
+
+    assert result.vignetting is not None
+    vignetting = result.vignetting[{result.axis_time: 0}]
+    vignetting = vignetting.ndarray_aligned(
+        (result.axis_detector_y, result.axis_detector_x)
+    )
+    assert np.allclose(vignetting, _vignetting_numpy(header), rtol=1e-6)
+
+
+def test_vignetting_dark(tmp_path: pathlib.Path) -> None:
+    """A dark frame is not corrected for vignetting."""
+    file = _write(tmp_path / "a.fits", image_type="dark")
+
+    result = hinode.xrt.Filtergram.from_fits(file)
+
+    assert result.vignetting is not None
+    assert np.all(result.vignetting == 1)
+
+
+def test_uncertainty(tmp_path: pathlib.Path) -> None:
+    """
+    The uncertainty is the photon noise of the signal before the vignetting
+    correction and the normalization, combined with the uncertainty map.
+    """
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+
+    images = hinode.xrt.Filtergram.from_fits(
+        path=path,
+        leak=True,
+        directory=tmp_path,
+    ).remove_leak()
+
+    dn_per_photon = 2.5 * u.DN / u.ph
+    result = images.uncertainty(dn_per_photon)
+
+    assert result.shape == images.outputs.shape
+    assert result.unit == u.DN / u.s
+
+    axes = (images.axis_time, images.axis_detector_y, images.axis_detector_x)
+    signal = images.outputs.ndarray_aligned(axes).to_value(u.DN / u.s)
+    assert images.vignetting is not None
+    assert images.uncertainty_map is not None
+    vignetting = images.vignetting.ndarray_aligned(axes)
+    uncertainty_map = images.uncertainty_map.ndarray_aligned(axes).value
+    exposure = u.Quantity(images.timedelta.ndarray).to_value(u.s)
+
+    expected = np.maximum(signal, 0) * 2.5 / (vignetting * exposure)
+    expected = np.sqrt(expected + uncertainty_map**2)
+
+    assert np.allclose(result.ndarray_aligned(axes).value, expected, rtol=1e-6)
+
+    # The negative signal the subtraction of the leak leaves has no photon noise
+    assert np.any(signal < 0)
+    negative = signal < 0
+    assert np.allclose(expected[negative], uncertainty_map[negative])
+
+
+def test_uncertainty_dn_per_photon() -> None:
+    """The signal of one photon may vary from pixel to pixel."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    images = hinode.xrt.Filtergram.from_fits(path)
+
+    dn_per_photon = na.ScalarArray(
+        ndarray=np.array([1, 4]) * u.DN / u.ph,
+        axes="dn_per_photon",
+    )
+    result = images.uncertainty(dn_per_photon)
+
+    low = result[dict(dn_per_photon=0)]
+    high = result[dict(dn_per_photon=1)]
+    assert np.all(low <= high)
+    assert np.all(images.uncertainty(1 * u.DN / u.ph) == low)
+
+
+def test_remove_leak() -> None:
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    images = hinode.xrt.Filtergram.from_fits(path, leak=True)
+
+    result = images.remove_leak(scale=0.8)
+
+    assert images.leak is not None
+    assert np.all(result.outputs == images.outputs - 0.8 * images.leak)
+    assert result.leak is images.leak
+    assert result.saturated is images.saturated
+
+
+def test_from_fits_leak_missing(tmp_path: pathlib.Path) -> None:
+    """A filter which SolarSoft has no image of the leak for."""
+    file = _write(tmp_path / "a.fits", filter_2="Ti_poly")
+    with pytest.raises(ValueError, match="no image of the light leak"):
+        hinode.xrt.Filtergram.from_fits(file, leak=True)
 
 
 def test_saturated_level_from_history(tmp_path: pathlib.Path) -> None:
@@ -508,6 +637,12 @@ def test_from_time_range_directory(tmp_path: pathlib.Path) -> None:
 
     hinode.xrt.Filtergram.from_time_range(**kwargs, overwrite=True)
     assert file.stat().st_mtime_ns != mtime
+
+    # The image of the leak is downloaded into the same directory
+    result = hinode.xrt.Filtergram.from_time_range(**kwargs, leak=True)
+    assert result.leak is not None
+    (leak,) = tmp_path.rglob("term_*.fits")
+    assert leak.name == "term_p4ap_20180712_171928.fits"
 
 
 def test_from_time_range_no_images() -> None:

@@ -77,4 +77,5 @@ intersphinx_mapping = {
     "matplotlib": ("https://matplotlib.org/stable", None),
     "astropy": ("https://docs.astropy.org/en/stable/", None),
     "named_arrays": ("https://named-arrays.readthedocs.io/en/stable/", None),
+    "xrtpy": ("https://xrtpy.readthedocs.io/en/stable/", None),
 }
