@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use hinode in your research, please cite it using these metadata."
+type: software
+title: hinode
+abstract: >-
+  hinode is a Python library for downloading and analyzing observations from
+  the Hinode satellite, starting with the X-Ray Telescope (XRT). Observations
+  are represented as named-arrays function arrays, so a sequence of images has
+  named axes and physical units, and carries the time and sky position of
+  every pixel.
+authors:
+  - family-names: Smart
+    given-names: Roy T.
+    orcid: "https://orcid.org/0000-0002-9997-5515"
+repository-code: "https://github.com/sun-data/hinode"
+url: "https://hinode.readthedocs.io"
+license: BSD-3-Clause
+keywords:
+  - Hinode
+  - XRT
+  - solar physics
+  - data access
