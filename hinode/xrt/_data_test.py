@@ -70,6 +70,8 @@ def _response(url: str, status: int, content: bytes = b"") -> requests.Response:
             "2019-09-30T18:00:30",
             "Al_poly",
             [
+                "H1700/L1_XRT20190930_175903.3.fits",
+                "H1700/L1_XRT20190930_175917.4.fits",
                 "H1700/L1_XRT20190930_175935.9.fits",
                 "H1700/L1_XRT20190930_175954.4.fits",
                 "H1800/L1_XRT20190930_180012.9.fits",
