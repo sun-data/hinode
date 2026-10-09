@@ -83,6 +83,15 @@ EUV Snapshot Imaging Spectrograph (ESIS) was observing the Sun on
         ax.set_ylabel(f"helioprojective $y$ ({unit:latex_inline})")
 
 
+Tutorials
+=========
+
+.. toctree::
+    :maxdepth: 1
+
+    tutorials/dem
+
+
 Citation
 ========
 

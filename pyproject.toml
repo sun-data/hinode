@@ -39,6 +39,8 @@ doc = [
     "ipykernel",
     "jupyter-sphinx",
     "sphinx-favicon",
+    "solar-dynamics-observatory>=1.2",
+    "utu>=0.3",
 ]
 
 [project.urls]
