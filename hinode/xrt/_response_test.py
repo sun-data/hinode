@@ -25,11 +25,16 @@ def test_name_xrtpy(filter: str, expected: str) -> None:
 
 
 @pytest.mark.parametrize(
-    argnames="filter,num_filter",
+    argnames="filter,axis_filter,num_filter",
     argvalues=[
-        ("Al_poly", 1),
-        (["Al_poly", "Ti_poly", "Al_poly/Ti_poly"], 3),
-        (na.ScalarArray(np.array(["Al_poly", "Be_thin"]), axes="channel"), 2),
+        ("Al_poly", "filter", 1),
+        (["Al_poly", "Ti_poly", "Al_poly/Ti_poly"], "filter", 3),
+        (na.ScalarArray(np.array("Al_poly")), "filter", 1),
+        (
+            na.ScalarArray(np.array(["Al_poly", "Be_thin"]), axes="channel"),
+            "channel",
+            2,
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -38,12 +43,11 @@ def test_name_xrtpy(filter: str, expected: str) -> None:
 )
 def test_temperature_response(
     filter: str | list[str] | na.ScalarArray,
+    axis_filter: str,
     num_filter: int,
     photons: bool,
 ) -> None:
     result = hinode.xrt.temperature_response(filter, _time, photons=photons)
-
-    axis_filter = "channel" if isinstance(filter, na.AbstractArray) else "filter"
 
     assert isinstance(result, na.FunctionArray)
     assert result.outputs.shape == {axis_filter: num_filter, "temperature": 61}

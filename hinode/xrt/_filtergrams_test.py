@@ -1,5 +1,6 @@
 import re
 import pathlib
+import dataclasses
 import pytest
 import numpy as np
 import astropy.units as u
@@ -445,6 +446,15 @@ def test_uncertainty_dn_per_photon() -> None:
     high = result[dict(dn_per_photon=1)]
     assert np.all(low <= high)
     assert np.all(images.uncertainty(1 * u.DN / u.ph) == low)
+
+
+def test_uncertainty_not_loaded() -> None:
+    """A filtergram made without :meth:`from_fits` has no uncertainty map."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    images = hinode.xrt.Filtergram.from_fits(path)
+    images = dataclasses.replace(images, uncertainty_map=None)
+    with pytest.raises(ValueError, match="needed"):
+        images.uncertainty(2.5 * u.DN / u.ph)
 
 
 def test_remove_leak() -> None:

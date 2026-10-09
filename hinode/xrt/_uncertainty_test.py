@@ -66,6 +66,12 @@ def test_error_jpeg() -> None:
     assert np.all(result[8:] == 0)
 
 
+def test_error_jpeg_quality_unknown() -> None:
+    signal = na.ScalarArray(np.zeros((8, 8)) << u.DN, axes=("y", "x"))
+    with pytest.raises(ValueError, match="not known"):
+        _error_jpeg(signal, 77, "x", "y")
+
+
 def test_error_jpeg_lossless() -> None:
     signal = na.ScalarArray(np.arange(64.0).reshape(8, 8) << u.DN, axes=("y", "x"))
     result = _error_jpeg(signal, None, "x", "y")
