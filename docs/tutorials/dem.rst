@@ -13,8 +13,8 @@ whole range.
 
 The jet is event E of :cite:t:`Parker2022`, which the EUV Snapshot Imaging
 Spectrograph (ESIS) observed on 2019 September 30.
-Its base is bright enough to saturate XRT, so the DEM there is found from AIA
-alone.
+Its base is bright enough to saturate a few pixels of XRT in two of the images,
+so the tutorial uses the image just before them.
 
 The tutorial uses
 the temperature response of XRT, :func:`hinode.xrt.temperature_response`,
@@ -28,7 +28,8 @@ and the regularized inversion of :cite:t:`Plowman2020`,
 Load the XRT image
 ------------------
 
-The Al_poly image during the ESIS flight with the most saturated pixels,
+The Al_poly image during the ESIS flight just before the first one with
+saturated pixels,
 with the visible light which leaks into XRT subtracted.
 The uncertainty map is loaded too, for the uncertainty of each pixel below.
 
@@ -59,7 +60,8 @@ The uncertainty map is loaded too, for the uncertainty of each pixel below.
     num_saturated = images.saturated.sum(
         axis=(images.axis_detector_x, images.axis_detector_y),
     )
-    xrt = images[np.argmax(num_saturated, axis=images.axis_time)]
+    first = np.argmax(num_saturated > 0, axis=images.axis_time)[images.axis_time]
+    xrt = images[{images.axis_time: first - 1}]
 
     xrt = xrt.remove_leak()
 
@@ -127,6 +129,10 @@ The image in each channel closest to the middle of the XRT exposure,
 registered, so that they share one grid of 0.6 arcsecond pixels.
 AIA takes an image in each channel every 12 seconds,
 so there is one in the 12 seconds around the middle.
+JSOC finds the images by the 12-second slot each one belongs to,
+rather than by when it was taken,
+so the search also finds images up to 12 seconds outside the range,
+and only the closest one in each channel is kept.
 
 .. jupyter-execute::
 
@@ -143,7 +149,15 @@ so there is one in the 12 seconds around the middle.
         wavelength=channels,
         register=True,
     )
-    aia = aia[dict(time=0)]
+
+    # the time from the middle of the XRT exposure to the middle of each
+    # AIA exposure
+    offset = na.ScalarArray(
+        ndarray=(aia.inputs.time.ndarray - middle).to(u.s),
+        axes=aia.inputs.time.axes,
+    ) + aia.timedelta / 2
+
+    aia = aia[np.argmin(np.abs(offset), axis="time")]
 
     # only the part of the disk around the box
     aia = aia[dict(
@@ -248,22 +262,8 @@ so they are divided by the solid angle of an XRT pixel.
     intensity_xrt = xrt.outputs / solid_angle_xrt
 
 The six AIA channels and XRT on the same pixels.
-The saturated pixels of XRT are outlined.
 
 .. jupyter-execute::
-
-    axes = ("detector_x", "detector_y")
-    centers = position_xrt.cell_centers(axes)
-
-    def outline(ax, where, color):
-        ax.contour(
-            centers.x.ndarray_aligned(axes),
-            centers.y.ndarray_aligned(axes),
-            where.ndarray_aligned(axes).astype(float),
-            levels=[0.5],
-            colors=color,
-            linewidths=0.8,
-        )
 
     panels = [
         (f"AIA {c:.0f} Å", intensity_aia[dict(channel=i)], f"sdoaia{c:.0f}")
@@ -292,7 +292,6 @@ The saturated pixels of XRT are outlined.
                     vmax=rate.value.percentile(99.9).ndarray,
                 ),
             )
-            outline(ax, xrt.saturated, "cyan")
             ax.set_title(title)
             ax.set_aspect("equal")
             ax.set_xlabel("")
@@ -497,7 +496,7 @@ Invert every pixel of the box.
 
 .. jupyter-execute::
 
-    dem_joint, chi2_joint = utu.dem.plowman(
+    dem, chi2 = utu.dem.plowman(
         intensity=intensity,
         uncertainty=stack(uncertainty_aia, uncertainty_xrt),
         response=response,
@@ -506,11 +505,12 @@ Invert every pixel of the box.
     )
 
     # the median reduced chi squared, which the inversion aims at one
-    chi2_joint.median()
+    chi2.median()
 
-The saturated pixels of XRT, and the ones around them,
-which the bright core lights up through the wings of the point-spread
-function, are inverted from AIA alone.
+For comparison, invert AIA alone too,
+and find the ratio of the XRT intensity each DEM predicts to the one observed.
+The emission measure in each step of temperature is the DEM times the step in
+:math:`\log_{10} T`.
 
 .. jupyter-execute::
 
@@ -522,18 +522,28 @@ function, are inverted from AIA alone.
         axis_temperature="temperature",
     )
 
-    # the saturated pixels, grown by 5 pixels in every direction
-    mask = na.ndfilters.mean_filter(
-        xrt.saturated.astype(float),
-        size=dict(detector_x=11, detector_y=11),
-    ) > 0
+    step = 0.05
 
-    dem = dem_joint.replace(
-        outputs=np.where(mask, dem_aia.outputs, dem_joint.outputs),
-    )
-    chi2 = np.where(mask, chi2_aia, chi2_joint)
+    # the ratio of the XRT intensity a DEM predicts to the one observed
+    def ratio_xrt(dem):
+        predicted = (dem.outputs * outputs_xrt * step).sum("temperature")
+        ratio = (predicted / intensity_xrt).to(u.dimensionless_unscaled)
+        return ratio[dict(channel=0)]
 
-    mask.sum()
+    ratio = ratio_xrt(dem)
+    ratio_aia = ratio_xrt(dem_aia)
+
+    # the median over the box
+    {
+        "AIA + XRT": ratio.median(),
+        "AIA only": ratio_aia.median(),
+    }
+
+In most of the box, the DEM from AIA alone predicts 8 to 23 times the XRT
+intensity observed.
+AIA sees so little of the plasma above about 4 MK that the smoothest DEM which
+fits its six channels can have a tail of hot plasma there,
+which XRT rules out.
 
 
 Results
@@ -543,8 +553,6 @@ The emission measure in four ranges of temperature, the integral of the DEM
 over each.
 
 .. jupyter-execute::
-
-    step = 0.05
 
     ranges = [(5.6, 6.0), (6.0, 6.3), (6.3, 6.6), (6.6, 7.0)]
 
@@ -582,21 +590,70 @@ over each.
             label=f"emission measure ({em[r].unit:latex_inline})",
         )
 
-The DEM of the brightest pixel of the base, which XRT saturates,
-so it is from AIA alone,
-and of a pixel in the spire, from both inversions.
+The whole DEM in one false-color image, made with
+:mod:`named_arrays.colorsynth`, as in the DEM tutorial of :mod:`sdo`.
+Temperature is mapped onto the visible spectrum, from violet for the coolest
+plasma to red for the hottest, and each pixel is colored as if the DEM were
+the spectrum of the light it emits.
+Every temperature shares one linear scale, up to the 99.5th percentile of the
+whole DEM, so the brightness of a pixel is how much plasma it has and the color
+is at what temperature.
+The plasma around the jet is mostly near 1 MK, which comes out blue,
+and the base of the jet, at 2 to 3 MK, comes out green.
+There is almost no red, since XRT allows almost none of the plasma above 4 MK
+that AIA alone would put there.
 
 .. jupyter-execute::
 
-    base = np.argmax(xrt.outputs, axis=axes)
+    constrained = dem[dict(temperature=slice(2, 35))]
+
+    # in units of 10^27 cm^-5, so that the colorbar needs no offset
+    dem_27 = (constrained.outputs / (1e27 / u.cm**5)).to(u.dimensionless_unscaled)
+
+    with astropy.visualization.quantity_support():
+        fig, axs = plt.subplots(
+            ncols=2,
+            figsize=(8, 7),
+            gridspec_kw=dict(width_ratios=[0.9, 0.1]),
+            constrained_layout=True,
+        )
+        colorbar = na.plt.rgbmesh(
+            np.log10(constrained.inputs / u.K),
+            position_xrt,
+            C=dem_27,
+            axis_wavelength="temperature",
+            ax=axs[0],
+            vmin=0,
+            vmax=np.nanpercentile(dem_27, q=99.5),
+        )
+        na.plt.pcolormesh(
+            C=colorbar,
+            axis_rgb="temperature",
+            ax=axs[1],
+        )
+        axs[0].set_aspect("equal")
+        axs[0].set_xlabel("helioprojective $x$ (arcsec)")
+        axs[0].set_ylabel("helioprojective $y$ (arcsec)")
+        axs[1].set_xlabel(r"DEM ($10^{27}\,\mathrm{cm^{-5}}$)")
+        axs[1].set_ylabel(r"$\log_{10} T$")
+        axs[1].yaxis.tick_right()
+        axs[1].yaxis.set_label_position("right")
+
+The DEM of the brightest pixel of the base and of a pixel in the spire,
+from AIA and XRT together and from AIA alone.
+The two agree on the plasma at 1 to 2 MK,
+and above about 3 MK AIA alone has the tail of hot plasma.
+
+.. jupyter-execute::
+
+    base = np.argmax(xrt.outputs, axis=("detector_x", "detector_y"))
     spire = dict(detector_x=65, detector_y=65)
 
-    panels = [
-        ("base", base, [("AIA only", dem_aia, chi2_aia)]),
-        ("spire", spire, [
-            ("AIA + XRT", dem_joint, chi2_joint),
-            ("AIA only", dem_aia, chi2_aia),
-        ]),
+    pixels = dict(base=base, spire=spire)
+
+    inversions = [
+        ("AIA + XRT", dem, chi2),
+        ("AIA only", dem_aia, chi2_aia),
     ]
 
     with astropy.visualization.quantity_support():
@@ -606,7 +663,7 @@ and of a pixel in the spire, from both inversions.
             sharey=True,
             constrained_layout=True,
         )
-        for ax, (title, index, inversions) in zip(axs, panels):
+        for ax, (title, index) in zip(axs, pixels.items()):
             for label, d, c in inversions:
                 na.plt.plot(
                     d.inputs,
@@ -630,17 +687,20 @@ The inversion stops as soon as the reduced :math:`\chi^2` reaches one,
 and with seven channels that can leave one of them, here XRT,
 further from its observation than its uncertainty;
 a smaller ``chi2_target`` fits it more closely.
-In the saturated pixels the observed intensity is only a lower limit,
-so a ratio of at least one there means AIA alone sees enough hot plasma to
-saturate XRT.
-The two dark spots, where the ratio is largest outside the core,
+The two dark spots, where the ratio is largest,
 look like spots of contamination on the CCD which the Level 1 processing did
 not fill in.
+A few dozen pixels around the base of the jet fit poorly too,
+with a reduced :math:`\chi^2` above 3.
+AIA alone fits them, so AIA and XRT disagree there:
+the DEM which XRT allows predicts more 131, 171, 193, and 211 Å than AIA
+observes, and less 335 Å.
+Why is not known yet.
+It may be the wings of the point-spread function of XRT,
+which the blur of AIA does not match,
+the co-alignment, or the responses.
 
 .. jupyter-execute::
-
-    predicted = (dem.outputs * outputs_xrt * step).sum("temperature")
-    ratio = (predicted / intensity_xrt).to(u.dimensionless_unscaled)
 
     with astropy.visualization.quantity_support():
         fig, axs = plt.subplots(
@@ -661,14 +721,13 @@ not fill in.
         fig.colorbar(mesh.ndarray.item(), ax=axs[0], label=r"reduced $\chi^2$")
         mesh = na.plt.pcolormesh(
             position_xrt,
-            C=ratio[dict(channel=0)],
+            C=ratio,
             ax=axs[1],
             cmap="RdBu_r",
             norm=matplotlib.colors.LogNorm(vmin=0.5, vmax=2),
         )
         fig.colorbar(mesh.ndarray.item(), ax=axs[1], label="predicted / observed XRT")
         for ax in axs:
-            outline(ax, mask, "k")
             ax.set_aspect("equal")
             ax.set_xlabel("")
             ax.set_ylabel("")
