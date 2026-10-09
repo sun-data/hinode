@@ -7,33 +7,18 @@ import named_arrays as na
 import hinode.xrt._leak
 from hinode.xrt._leak import _leak, _phase, _size_leak
 
-
-def _rebin_numpy(image: np.ndarray, factor: int) -> np.ndarray:
-    """
-    An image magnified by an integer factor along both axes,
-    as ``rebin`` in IDL magnifies it,
-    interpolating linearly between the pixels
-    and repeating the last pixel beyond it.
-    """
-    for axis in range(image.ndim):
-        num = image.shape[axis]
-        position = np.arange(num * factor) / factor
-        i0 = np.floor(position).astype(int)
-        i1 = np.minimum(i0 + 1, num - 1)
-        fraction = position - i0
-        shape = [1] * image.ndim
-        shape[axis] = -1
-        fraction = fraction.reshape(shape)
-        image = (1 - fraction) * np.take(image, i0, axis) + fraction * np.take(
-            image, i1, axis
-        )
-    return image
+_scale_row = 1000
+"""How much the synthetic leak image grows from one row to the next."""
 
 
 def _image_synthetic(file: str, directory: None | pathlib.Path) -> np.ndarray:
-    """A random image of the leak, made without connecting to SolarSoft."""
-    rng = np.random.default_rng(0)
-    return rng.uniform(0, 2, size=(_size_leak, _size_leak))
+    """
+    An image of the leak which grows linearly along the rows and the columns,
+    made without connecting to SolarSoft,
+    so that its interpolation and its sums are known exactly.
+    """
+    row, column = np.indices((_size_leak, _size_leak))
+    return (_scale_row * row + column).astype(float)
 
 
 @pytest.mark.parametrize(
@@ -102,7 +87,9 @@ def test_leak_missing(filter: str, time: str) -> None:
         (2, 7, 5, 872, 857),
         (4, 512, 512, 0, 0),
         (4, 7, 5, 872, 856),
+        (4, 7, 5, 874, 858),
         (8, 3, 2, 1016, 8),
+        (8, 3, 2, 1020, 12),
     ],
 )
 def test_leak_resample(
@@ -118,7 +105,6 @@ def test_leak_resample(
     as ``xrt_synleaksub.pro`` does for a full-resolution or 2 by 2 image.
     """
     monkeypatch.setattr(hinode.xrt._leak, "_image_leak", _image_synthetic)
-    image = _image_synthetic("", None)
 
     result = _leak(
         filter="Al_poly",
@@ -132,17 +118,24 @@ def test_leak_resample(
         axis_detector_y="y",
     )
 
+    x = np.arange(num_x)[np.newaxis, :]
+    y = np.arange(num_y)[:, np.newaxis]
+    last = _size_leak - 1
+
     if chip_sum == 1:
-        expected = _rebin_numpy(image, 2) / 4
-        expected = expected[pos_row : pos_row + num_y, pos_col : pos_col + num_x]
+        # The bilinear interpolation of a linear image is exact,
+        # and `rebin` repeats the last pixel beyond it.
+        column = np.minimum((pos_col + x) / 2, last)
+        row = np.minimum((pos_row + y) / 2, last)
+        expected = (_scale_row * row + column) / 4
     else:
+        # The sum of the `factor` by `factor` pixels from the first pixel of
+        # the leak image in each pixel of the image.
         factor = chip_sum // 2
-        binned = image.reshape(
-            _size_leak // factor, factor, _size_leak // factor, factor
-        ).sum(axis=(1, 3))
-        x = pos_col // chip_sum
-        y = pos_row // chip_sum
-        expected = binned[y : y + num_y, x : x + num_x]
+        column = pos_col // 2 + factor * x
+        row = pos_row // 2 + factor * y
+        mean = _scale_row * row + column + (_scale_row + 1) * (factor - 1) / 2
+        expected = factor**2 * mean
 
     assert result.shape == {"y": num_y, "x": num_x}
     assert result.unit == u.DN / u.s

@@ -6,7 +6,6 @@ from hinode.xrt._uncertainty import (
     _quality,
     _error_jpeg,
     _error_dark,
-    _error_vignetting,
 )
 
 _history_strip = (
@@ -30,9 +29,17 @@ def test_quality(compression: int, table: int, expected: None | int) -> None:
     assert _quality(compression, table) == expected
 
 
-def test_quality_unknown() -> None:
+@pytest.mark.parametrize(
+    argnames="compression,table",
+    argvalues=[
+        (5, 0),
+        (7, -1),
+        (7, 8),
+    ],
+)
+def test_quality_unknown(compression: int, table: int) -> None:
     with pytest.raises(ValueError, match="not known"):
-        _quality(5, 0)
+        _quality(compression, table)
 
 
 def test_error_jpeg() -> None:
@@ -102,21 +109,3 @@ def test_error_dark(
 def test_error_dark_chip_sum() -> None:
     with pytest.raises(ValueError, match="not supported"):
         _error_dark("", 3, 2048, 2048, 90)
-
-
-def test_error_vignetting() -> None:
-    """
-    The relative error of the vignetting correction is 0.45% within about
-    10 arcminutes of the center of the CCD, and grows beyond.
-    """
-    result = _error_vignetting(
-        num_x=2048,
-        num_y=2048,
-        chip_sum=1,
-        p1_col=0,
-        p1_row=0,
-        axis_detector_x="x",
-        axis_detector_y="y",
-    )
-    assert result[dict(x=1024, y=1024)] == 0.0045
-    assert np.isclose(result[dict(x=0, y=0)].ndarray, 0.1390335796672054)

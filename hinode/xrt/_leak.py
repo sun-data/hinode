@@ -63,6 +63,12 @@ The image of the leak through each filter in each stray-light phase,
 as ``xrt_synleaksub.pro`` in SolarSoft selects them.
 """
 
+_history_leak = "Light leak subtraction: DONE"
+"""
+The entry in the history of a file which ``xrt_synleaksub.pro`` writes when
+it subtracts the leak.
+"""
+
 _size_leak = 1024
 """
 The number of pixels along each axis of the images of the leak,
@@ -212,14 +218,15 @@ def _leak(
 
     elif chip_sum % 2 == 0:
         # Each pixel of the image covers `factor` by `factor` pixels of the
-        # leak image.
+        # leak image, starting from the pixel of the leak image which holds
+        # the first pixel of the CCD in the image.
         factor = chip_sum // 2
         result = na.ScalarArray.zeros(shape) << unit
         for i in range(factor):
             for j in range(factor):
                 index = {
-                    axis_detector_x: factor * (x + pos_col // chip_sum) + i,
-                    axis_detector_y: factor * (y + pos_row // chip_sum) + j,
+                    axis_detector_x: pos_col // 2 + factor * x + i,
+                    axis_detector_y: pos_row // 2 + factor * y + j,
                 }
                 result = result + image[index]
 

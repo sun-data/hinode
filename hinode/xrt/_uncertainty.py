@@ -121,6 +121,8 @@ def _quality(
         return None
     if compression != 7:
         raise ValueError(f"The compression of the image, {compression}, is not known.")
+    if not 0 <= table < len(_quality_table):
+        raise ValueError(f"The quantization table of the image, {table}, is not known.")
     return _quality_table[table]
 
 
@@ -264,52 +266,3 @@ def _error_dark(
 
     error = np.sqrt(scatter**2 + (average * factor_fourier * factor_size) ** 2)
     return error * u.DN
-
-
-def _error_vignetting(
-    num_x: int,
-    num_y: int,
-    chip_sum: int,
-    p1_col: int,
-    p1_row: int,
-    axis_detector_x: str,
-    axis_detector_y: str,
-) -> na.ScalarArray:
-    """
-    The relative error of the vignetting correction of each pixel of an image,
-    which is not a dark frame,
-    as ``xrt_vign_unc.pro`` in SolarSoft gives it.
-
-    Parameters
-    ----------
-    num_x
-        The number of columns of the image, ``NAXIS1``.
-    num_y
-        The number of rows of the image, ``NAXIS2``.
-    chip_sum
-        The number of pixels of the CCD summed along each axis into each
-        pixel of the image, ``CHIP_SUM``.
-    p1_col
-        The first column of the CCD in the image, in unsummed pixels,
-        ``P1COL``.
-    p1_row
-        The first row of the CCD in the image, in unsummed pixels,
-        ``P1ROW``.
-    axis_detector_x
-        The logical axis corresponding to changes in detector :math:`x`-coordinate.
-    axis_detector_y
-        The logical axis corresponding to changes in detector :math:`y`-coordinate.
-    """
-    x = na.arange(0, num_x, axis=axis_detector_x) + p1_col // chip_sum
-    y = na.arange(0, num_y, axis=axis_detector_y) + p1_row // chip_sum
-
-    center = 1024 / chip_sum
-
-    # The angle from the center of the CCD, in arcminutes
-    angle = np.sqrt(np.square(x - center) + np.square(y - center))
-    angle = angle * 1.0286 * chip_sum / 60
-
-    outer = (21.4681 - 6.11904 * angle + 0.444524 * np.square(angle)) / 1000 - 0.0045
-    result = 0.0045 * (angle <= 9.916) + (angle >= 9.916) * outer
-
-    return typing.cast(na.ScalarArray, result)

@@ -20,6 +20,8 @@ def test_open_leak() -> None:
         time_start="2019-09-30T18:08:30",
         time_stop="2019-09-30T18:09:00",
         leak=True,
+        uncertainty=True,
     )
     assert result.leak is not None
     assert result.leak.shape == result.outputs.shape
+    assert result.uncertainty_map is not None

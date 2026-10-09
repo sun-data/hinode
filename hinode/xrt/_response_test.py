@@ -5,6 +5,7 @@ import astropy.constants
 import astropy.time
 import named_arrays as na
 import xrtpy.response
+from xrtpy.response.effective_area import parse_filter_input
 import hinode
 from hinode.xrt._response import _name_xrtpy
 
@@ -12,16 +13,29 @@ _time = astropy.time.Time("2019-09-30T18:08:00")
 
 
 @pytest.mark.parametrize(
-    argnames="filter,expected",
+    argnames="filter",
     argvalues=[
-        ("Al_poly", "Al-poly"),
-        ("Gband", "G-band"),
-        ("Al_poly/Ti_poly", "Al-poly/Ti-poly"),
-        ("Be_thick", "Be-thick"),
+        "Al_poly",
+        "C_poly",
+        "Be_thin",
+        "Be_med",
+        "Al_med",
+        "Al_mesh",
+        "Ti_poly",
+        "Gband",
+        "Al_thick",
+        "Be_thick",
+        "Al_poly/Ti_poly",
+        "C_poly/Ti_poly",
     ],
 )
-def test_name_xrtpy(filter: str, expected: str) -> None:
-    assert _name_xrtpy(filter) == expected
+def test_name_xrtpy(filter: str) -> None:
+    """Every filter, named as in the headers, is one :mod:`xrtpy` knows."""
+    parsed = parse_filter_input(_name_xrtpy(filter))
+    names = [parsed.filter1, parsed.filter2] if parsed.is_combo else [parsed.filter1]
+    assert [n.replace("-", "").lower() for n in names] == [
+        n.replace("_", "").lower() for n in filter.split("/")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -38,23 +52,25 @@ def test_name_xrtpy(filter: str, expected: str) -> None:
     ],
 )
 @pytest.mark.parametrize(
-    argnames="photons",
+    argnames="variance",
     argvalues=[False, True],
 )
 def test_temperature_response(
     filter: str | list[str] | na.ScalarArray,
     axis_filter: str,
     num_filter: int,
-    photons: bool,
+    variance: bool,
 ) -> None:
-    result = hinode.xrt.temperature_response(filter, _time, photons=photons)
+    result = hinode.xrt.temperature_response(filter, _time, variance=variance)
 
     assert isinstance(result, na.FunctionArray)
     assert result.outputs.shape == {axis_filter: num_filter, "temperature": 61}
     assert result.inputs.shape == {"temperature": 61}
 
-    unit = u.ph if photons else u.DN
-    assert result.outputs.unit.is_equivalent(unit * u.cm**5 / u.s / u.pix)
+    unit = u.DN * u.cm**5 / u.s / u.pix
+    if variance:
+        unit = unit * u.DN / u.ph
+    assert result.outputs.unit == unit
 
     log_temperature = np.log10(result.inputs.ndarray.to_value(u.K))
     assert np.allclose(log_temperature[[0, -1]], [5, 8], atol=1e-6)
@@ -68,31 +84,66 @@ def test_temperature_response_xrtpy() -> None:
     channel = xrtpy.response.TemperatureResponseFundamental("Al-poly", _time)
     expected = channel.temperature_response()
 
-    assert np.array_equal(result.outputs[dict(filter=0)].ndarray, expected)
+    assert np.allclose(result.outputs[dict(filter=0)].ndarray, expected, rtol=1e-12)
     assert np.array_equal(result.inputs.ndarray, channel.CHIANTI_temperature)
 
 
-def test_temperature_response_photons() -> None:
+def _signal_numpy(filter: str) -> tuple[np.ndarray, np.ndarray]:
     """
-    The signal of one photon from plasma at any temperature lies between
-    that of the longest and of the shortest wavelengths the filter passes.
+    The rate at which the CCD absorbs photons of each wavelength from plasma
+    at each temperature, indexed by temperature and wavelength,
+    and the signal of one photon of each wavelength,
+    from the parts :mod:`xrtpy` computes.
+    """
+    channel = xrtpy.response.TemperatureResponseFundamental(filter, _time)
+    wavelength = channel.wavelength
+    rate = (
+        channel.spectra()
+        * channel.effective_area()
+        * channel.solid_angle_per_pixel
+        * np.gradient(wavelength)
+    )
+    energy = astropy.constants.h * astropy.constants.c / wavelength / u.ph
+    signal = energy / channel.ev_per_electron / channel.ccd_gain_right
+    return rate, signal
+
+
+@pytest.mark.parametrize(
+    argnames="filter",
+    argvalues=["Al_poly", "Ti_poly"],
+)
+def test_temperature_response_variance(filter: str) -> None:
+    """
+    The variance of the signal grows with the sum over wavelength of the
+    rate of the photons times the square of their signal,
+    so the factor which sets the photon noise is larger than the average
+    signal of one photon.
+    """
+    response = hinode.xrt.temperature_response(filter, _time)
+    variance = hinode.xrt.temperature_response(filter, _time, variance=True)
+
+    rate, signal = _signal_numpy(_name_xrtpy(filter))
+    expected = (rate * signal**2).sum(axis=1)
+    result = variance.outputs[dict(filter=0)].ndarray
+    assert np.allclose(result, expected.to(result.unit), rtol=1e-12)
+
+    factor = (variance.outputs / response.outputs)[dict(filter=0)].ndarray
+    average = (rate * signal).sum(axis=1) / rate.sum(axis=1)
+    assert np.all(factor.to(u.DN / u.ph) >= average.to(u.DN / u.ph))
+    assert np.all(factor <= signal.max())
+
+
+def test_temperature_response_variance_value() -> None:
+    """
+    The factor which sets the photon noise of plasma at log T 6.0 through
+    Al_poly, about 1.7 times the average signal of one photon, 0.94 DN.
     """
     response = hinode.xrt.temperature_response("Al_poly", _time)
-    photons = hinode.xrt.temperature_response("Al_poly", _time, photons=True)
-
-    ratio = (response.outputs / photons.outputs).to(u.DN / u.ph)
-
-    channel = xrtpy.response.TemperatureResponseFundamental("Al-poly", _time)
-    energy = astropy.constants.h * astropy.constants.c / channel.wavelength
-    signal = energy / channel.ev_per_electron / channel.ccd_gain_right
-    signal = signal.to(u.DN) / u.ph
-
-    assert np.all(ratio.ndarray >= signal.min())
-    assert np.all(ratio.ndarray <= signal.max())
-
-    # Hotter plasma emits shorter wavelengths, from log T 6 to 7
-    hot = ratio[dict(filter=0, temperature=slice(20, 41))]
-    assert np.all(np.diff(hot, axis="temperature") > 0)
+    variance = hinode.xrt.temperature_response("Al_poly", _time, variance=True)
+    index = dict(filter=0, temperature=20)
+    assert np.isclose(response.inputs[index].ndarray, 10**6 * u.K)
+    factor = (variance.outputs / response.outputs)[index].ndarray
+    assert np.isclose(factor, 1.6094 * u.DN / u.ph, rtol=1e-4)
 
 
 def test_temperature_response_abundance() -> None:

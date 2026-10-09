@@ -18,6 +18,7 @@ def open(
     overwrite: bool = False,
     num_retry: int = 5,
     leak: bool = False,
+    uncertainty: bool = False,
 ) -> Filtergram:
     """
     Download the Level 1 XRT images which began during a given time range
@@ -53,6 +54,10 @@ def open(
     leak
         Whether to load the visible light leaking into each pixel,
         :attr:`~hinode.xrt.Filtergram.leak`.
+    uncertainty
+        Whether to load :attr:`~hinode.xrt.Filtergram.vignetting` and
+        :attr:`~hinode.xrt.Filtergram.uncertainty_map`,
+        which :meth:`~hinode.xrt.Filtergram.uncertainty` needs.
     """
     return Filtergram.from_time_range(
         time_start=time_start,
@@ -65,4 +70,5 @@ def open(
         overwrite=overwrite,
         num_retry=num_retry,
         leak=leak,
+        uncertainty=uncertainty,
     )

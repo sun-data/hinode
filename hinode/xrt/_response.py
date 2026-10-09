@@ -9,6 +9,13 @@ __all__ = [
     "temperature_response",
 ]
 
+_names_xrtpy = {"Gband": "G-band"}
+"""
+The filters which :mod:`xrtpy` names differently from the ``EC_FW1_`` and
+``EC_FW2_`` header keywords,
+beyond the hyphens in place of underscores which it adds itself.
+"""
+
 
 def _name_xrtpy(filter: str) -> str:
     """
@@ -21,15 +28,14 @@ def _name_xrtpy(filter: str) -> str:
         The filters, as in the ``EC_FW1_`` and ``EC_FW2_`` header keywords,
         joined by a slash, such as ``"Al_poly"`` or ``"Al_poly/Ti_poly"``.
     """
-    names = {"Gband": "G-band"}
-    return "/".join(names.get(f, f.replace("_", "-")) for f in filter.split("/"))
+    return "/".join(_names_xrtpy.get(f, f) for f in filter.split("/"))
 
 
 def temperature_response(
     filter: str | Sequence[str] | na.AbstractScalarArray,
     time: str | astropy.time.Time,
     abundance: str = "coronal",
-    photons: bool = False,
+    variance: bool = False,
     axis_filter: str = "filter",
     axis_temperature: str = "temperature",
 ) -> na.FunctionArray[na.ScalarArray, na.ScalarArray]:
@@ -56,11 +62,11 @@ def temperature_response(
     abundance
         The abundances of the CHIANTI spectrum,
         ``"coronal"``, ``"hybrid"``, or ``"photospheric"``.
-    photons
-        If :obj:`True`, the response is the number of photons the CCD absorbs,
-        rather than the signal in DN, so that the ratio of the two responses is
-        the average signal of one photon from plasma at each temperature,
-        which sets the photon noise of :meth:`hinode.xrt.Filtergram.uncertainty`.
+    variance
+        If :obj:`True`, the response is the variance of the signal due to the
+        counting of the photons, rather than the signal,
+        so that the ratio of the two responses is the factor which sets the
+        photon noise of :meth:`hinode.xrt.Filtergram.uncertainty`.
     axis_filter
         The name of the axis along the filters, if `filter` does not
         already have one.
@@ -72,29 +78,43 @@ def temperature_response(
     A function of temperature whose outputs are the response of each filter
     to unit emission measure, in
     :math:`\text{DN}\,\text{cm}^5\,\text{s}^{-1}\,\text{pix}^{-1}`,
-    or in :math:`\text{ph}\,\text{cm}^5\,\text{s}^{-1}\,\text{pix}^{-1}`
-    if `photons` is :obj:`True`.
+    or in :math:`\text{DN}^2\,\text{cm}^5\,\text{s}^{-1}\,\text{pix}^{-1}\,\text{ph}^{-1}`
+    if `variance` is :obj:`True`.
 
     Notes
     -----
-    The spectra distributed with :mod:`xrtpy` 0.5 were computed with CHIANTI
-    10.0 at a constant electron density of :math:`10^9\,\text{cm}^{-3}`,
-    at log temperatures from 5 to 8 in steps of 0.05.
-    The temperature response of the AIA channels in :mod:`sdo` uses an
-    older version of CHIANTI at a constant pressure,
+    The coronal spectrum distributed with :mod:`xrtpy` 0.5 was computed with
+    CHIANTI 10.0, and the hybrid and photospheric spectra with CHIANTI 9.01,
+    as the metadata of their files say, all at a constant electron density
+    of :math:`10^9\,\text{cm}^{-3}` and at log temperatures from 5 to 8 in
+    steps of 0.05.
+    The temperature response of the AIA channels in :mod:`sdo` uses another
+    version of CHIANTI at a constant pressure,
     so a DEM found from both instruments is usually allowed a factor between
     the two responses.
 
-    The response in photons is the sum which
-    :meth:`xrtpy.response.TemperatureResponseFundamental.integration` takes
-    over wavelength, without the energy of each photon, the energy needed to
-    free an electron, and the gain of the CCD.
+    Each photon of wavelength :math:`\lambda` gives a signal
+    :math:`s = h c / (\lambda w G)`,
+    where :math:`w` is the energy needed to free an electron
+    and :math:`G` is the gain of the CCD.
+    The response is the sum over wavelength of the rate :math:`n` at which the
+    CCD absorbs photons times their signal,
+    :math:`R = \sum n s`,
+    which is the sum :meth:`xrtpy.response.TemperatureResponseFundamental.integration`
+    takes.
+    The number of photons is a Poisson variable and their signals differ,
+    so the variance of the signal grows at the rate
+    :math:`R_\sigma = \sum n s^2`,
+    and the variance of a pixel is its signal times
+    :math:`R_\sigma / R = \langle s^2 \rangle / \langle s \rangle`,
+    which is larger than the average signal of one photon,
+    :math:`\langle s \rangle`.
 
     Examples
     --------
     The response of the Al_poly filter on the date of the flight of the EUV
     Snapshot Imaging Spectrograph (ESIS),
-    and the average signal of one photon at each temperature.
+    and the factor which sets the photon noise at each temperature.
 
     .. jupyter-execute::
 
@@ -105,10 +125,10 @@ def temperature_response(
         import hinode
 
         response = hinode.xrt.temperature_response("Al_poly", "2019-09-30")
-        photons = hinode.xrt.temperature_response(
+        variance = hinode.xrt.temperature_response(
             filter="Al_poly",
             time="2019-09-30",
-            photons=True,
+            variance=True,
         )
 
         index = dict(filter=0)
@@ -127,14 +147,14 @@ def temperature_response(
             )
             na.plt.plot(
                 response.inputs,
-                (response.outputs / photons.outputs)[index],
+                (variance.outputs / response.outputs)[index],
                 ax=axs[1],
                 axis="temperature",
             )
             axs[0].set_xscale("log")
             axs[0].set_yscale("log")
             axs[0].set_ylabel(f"response ({response.outputs.unit:latex_inline})")
-            axs[1].set_ylabel("signal of one photon (DN / ph)")
+            axs[1].set_ylabel("photon noise (DN / ph)")
             axs[1].set_xlabel(f"temperature ({response.inputs.unit:latex_inline})")
     """
     # Imported here, since it takes several seconds to import
@@ -164,23 +184,43 @@ def temperature_response(
         for name in np.ravel(np.asarray(filter.ndarray))
     ]
 
+    axis_wavelength = "_wavelength"
+
     responses = []
     for channel in channels:
-        if photons:
-            response = (
-                channel.spectra()
-                * channel.effective_area()
-                * channel.solid_angle_per_pixel
-                * np.gradient(channel.wavelength)
-            ).sum(axis=1)
-        else:
-            response = channel.temperature_response()
-        responses.append(na.ScalarArray(response, axes=axis_temperature))
+        wavelength = u.Quantity(channel.wavelength)
+        energy = wavelength.to(u.eV, equivalencies=u.spectral()) / u.ph
+        energy = na.ScalarArray(energy, axes=axis_wavelength)
+        width = na.ScalarArray(np.gradient(wavelength), axes=axis_wavelength)
+
+        # The spectrum at each temperature, on the wavelengths of the channel
+        spectrum = na.ScalarArray(
+            ndarray=u.Quantity(channel.spectra()),
+            axes=(axis_temperature, axis_wavelength),
+        )
+        area = na.ScalarArray(
+            ndarray=u.Quantity(channel.effective_area()),
+            axes=axis_wavelength,
+        )
+
+        # The rate at which the CCD absorbs photons of each wavelength,
+        # and the signal of each one
+        rate = spectrum * area * channel.solid_angle_per_pixel * width
+        signal = energy / channel.ev_per_electron / channel.ccd_gain_right
+
+        power = 2 if variance else 1
+        response = (rate * signal**power).sum(axis_wavelength, where=True)
+        responses.append(response)
 
     # Every filter has the temperatures of the same spectra
     temperature = u.Quantity(channels[0].CHIANTI_temperature)
 
+    unit = u.DN * u.cm**5 / u.s / u.pix
+    if variance:
+        unit = unit * u.DN / u.ph
+    outputs = typing.cast(na.ScalarArray, na.stack(responses, axis=axis_filter))
+
     return na.FunctionArray(
         inputs=na.ScalarArray(temperature, axes=axis_temperature),
-        outputs=typing.cast(na.ScalarArray, na.stack(responses, axis=axis_filter)),
+        outputs=typing.cast(na.ScalarArray, outputs.to(unit)),
     )
