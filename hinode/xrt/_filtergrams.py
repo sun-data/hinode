@@ -1,4 +1,4 @@
-from typing import Sequence
+from typing import Sequence, Literal
 import typing
 import os
 import re
@@ -14,6 +14,7 @@ from ._data import _filter, _history
 from ._leak import _leak, _history_leak
 from ._uncertainty import _quality, _error_jpeg, _error_dark
 from ._vignetting import _vignetting, _error_vignetting
+from ._coalign import _check_coalign, _coalign
 
 __all__ = [
     "Filtergram",
@@ -119,6 +120,11 @@ class Filtergram(
     Each image is one frame along :attr:`axis_time`,
     and its coordinates come from its own header,
     since the pointing changes from one image to the next.
+    By default the pointing is corrected with the co-alignment database of
+    SolarSoft from the cross-correlation of XRT with AIA
+    :cite:p:`Yoshimura2015`,
+    so that the images line up with those of AIA,
+    as :attr:`coalignment` records.
 
     The time of each image, ``inputs.time``, is the start of its exposure,
     ``DATE_OBS``, as in the other sun-data packages,
@@ -272,6 +278,21 @@ class Filtergram(
     named as in :func:`hinode.xrt.urls`.
     """
 
+    coalignment: None | na.ScalarArray = None
+    """
+    How the pointing of each image was found,
+    numbered as ``CALIBRATION_TYPE`` of ``xrt_read_coaldb.pro`` in SolarSoft:
+    1 for the cross-correlation with AIA,
+    2 for a fit to the limb of the Sun in G-band,
+    3 for the Ultra Fine Sun Sensors (UFSS),
+    4 for a fit to the limb in X-rays,
+    6 for another method,
+    and -1 for an image no database had an entry for,
+    which keeps the center and the plate scale of its header
+    but is still given the roll of ``xrt_rollangle.pro``,
+    or :obj:`None` if the pointing was not corrected.
+    """
+
     axis_time: str = "time"
     """The logical axis corresponding to changes in time."""
 
@@ -295,6 +316,7 @@ class Filtergram(
         num_retry: int = 5,
         leak: bool = False,
         uncertainty: bool = False,
+        coalign: None | Literal["aia", "ufss"] = "aia",
     ) -> "Filtergram":
         """
         Download the Level 1 images which began during a given time range
@@ -330,7 +352,30 @@ class Filtergram(
         uncertainty
             Whether to load :attr:`vignetting` and :attr:`uncertainty_map`,
             which :meth:`uncertainty` needs.
+        coalign
+            Which co-alignment database of SolarSoft to correct the pointing
+            of the images with, as ``xrt_read_coaldb.pro`` does,
+            or :obj:`None` to keep the pointing of the headers.
+            ``"aia"`` (the default) uses the cross-correlation of each image
+            with AIA 335 Å :cite:p:`Yoshimura2015`,
+            and the Ultra Fine Sun Sensors (UFSS) of Hinode for an image it
+            has no entry for,
+            as ``xrt_read_coaldb.pro`` does with ``/aia_cc``.
+            ``"ufss"`` uses the UFSS alone, as it does by default.
+            See :attr:`coalignment`.
+
+        Raises
+        ------
+        ValueError
+            If `coalign` is not ``"aia"``, ``"ufss"``, or :obj:`None`,
+            which is checked before any image is downloaded,
+            or for the reasons :meth:`from_fits` gives.
+        ConnectionError
+            For the reasons :meth:`from_fits` gives.
         """
+        if coalign is not None:
+            _check_coalign(coalign)
+
         urls = hinode.xrt.urls(
             time_start=time_start,
             time_stop=time_stop,
@@ -358,7 +403,9 @@ class Filtergram(
             axis_detector_y=axis_detector_y,
             leak=leak,
             uncertainty=uncertainty,
+            coalign=coalign,
             directory=directory,
+            num_retry=num_retry,
         )
 
     @classmethod
@@ -370,7 +417,9 @@ class Filtergram(
         axis_detector_y: str = "detector_y",
         leak: bool = False,
         uncertainty: bool = False,
+        coalign: None | Literal["aia", "ufss"] = "aia",
         directory: None | pathlib.Path = None,
+        num_retry: int = 5,
     ) -> "Filtergram":
         """
         Load one or more Level 1 XRT files taken through the same filter.
@@ -399,9 +448,24 @@ class Filtergram(
             which :meth:`uncertainty` needs.
             They are not loaded by default,
             since each takes as much memory as the images.
+        coalign
+            Which co-alignment database of SolarSoft to correct the pointing
+            of the images with, as ``xrt_read_coaldb.pro`` does,
+            or :obj:`None` to keep the pointing of the headers.
+            ``"aia"`` (the default) uses the cross-correlation of each image
+            with AIA 335 Å :cite:p:`Yoshimura2015`,
+            and the Ultra Fine Sun Sensors (UFSS) of Hinode for an image it
+            has no entry for,
+            as ``xrt_read_coaldb.pro`` does with ``/aia_cc``.
+            ``"ufss"`` uses the UFSS alone, as it does by default.
+            See :attr:`coalignment`.
         directory
-            The directory to place the downloaded images of the leak in.
+            The directory to place the downloaded images of the leak and the
+            co-alignment databases in.
             If :obj:`None` (the default), :data:`hinode.directory_default` is used.
+        num_retry
+            The number of times to try to connect to the server
+            for the co-alignment databases.
 
         Raises
         ------
@@ -412,8 +476,13 @@ class Filtergram(
             ``xrt_prep`` set the saturated pixels to,
             if `leak` is :obj:`True` and SolarSoft has no image of the leak
             for the filter and the time of an image,
-            or if `uncertainty` is :obj:`True` and the compression of an
-            image is not known.
+            if `uncertainty` is :obj:`True` and the compression of an
+            image is not known,
+            or if `coalign` is not ``"aia"``, ``"ufss"``, or :obj:`None`.
+        ConnectionError
+            If a file of the co-alignment databases an image needs has not
+            been downloaded before and cannot be downloaded,
+            in which case ``coalign=None`` keeps the pointing of the headers.
 
         Notes
         -----
@@ -423,7 +492,40 @@ class Filtergram(
         The headers give the roll of each image as ``CROTA2`` rather than as
         a ``PC`` matrix, and it is converted to one the way
         :cite:t:`Calabretta2002` describe for that older keyword.
+
+        ``xrt_prep`` has already corrected the pointing of the Level 1 files
+        with the UFSS, so the center of an image moves only with ``"aia"``,
+        the default.
+        Either database also gives each image the roll ``xrt_rollangle.pro``
+        gives it now.
+        Since the attitude anomaly of 2021 December 27,
+        the roll is interpolated in a database which grows as the roll is
+        measured,
+        and some of the files ``xrt_prep`` made before it existed have a roll
+        in their header which is more than a degree from it,
+        and up to 23 degrees during the anomaly.
+        Like ``xrt_read_coaldb.pro``,
+        the correction places the center the database gives at pixel
+        ``NAXIS // 2 + 0.5``, counted from one,
+        with the plate scale of the X-ray or the G-band images.
+
+        The files of the databases are downloaded to `directory` the first
+        time an image needs them.
+        They are downloaded again when the listing of the server shows they
+        have changed,
+        and the listings and the database of the roll are checked again after
+        a day for an image later than they reach,
+        and after a month for any image.
+        If the server cannot be reached,
+        the copies downloaded before are used, with a warning.
+        A warning is also given for an image the database of the roll does
+        not reach yet,
+        since it is extrapolated, as ``xrt_rollangle.pro`` extrapolates it,
+        and the measurements reach the server days after the images.
         """
+        if coalign is not None:
+            _check_coalign(coalign)
+
         if isinstance(path, na.AbstractScalarArray):
             path = [str(p) for p in np.ravel(np.asarray(path.ndarray))]
         elif isinstance(path, (str, os.PathLike)):
@@ -442,6 +544,22 @@ class Filtergram(
         for p, header in zip(path, headers):
             _check_normalized(header, p)
         levels = [_level_saturation(header, p) for p, header in zip(path, headers)]
+
+        coalignment = None
+        if coalign is not None:
+            keywords, calibration = _coalign(
+                time=[h["DATE_OBS"] for h in headers],
+                filter_2=[int(h["EC_FW2"]) for h in headers],
+                chip_sum=[int(h["CHIP_SUM"]) for h in headers],
+                num_x=[int(h["NAXIS1"]) for h in headers],
+                num_y=[int(h["NAXIS2"]) for h in headers],
+                coalign=coalign,
+                directory=directory,
+                num_retry=num_retry,
+            )
+            for header, keywords_header in zip(headers, keywords):
+                header.update(keywords_header)
+            coalignment = na.ScalarArray(calibration, axes=axis_time)
 
         shape = {
             axis_time: len(headers),
@@ -666,6 +784,7 @@ class Filtergram(
             uncertainty_map=uncertainty_map,
             leak=leaks,
             filter=filters[0],
+            coalignment=coalignment,
             axis_time=axis_time,
             axis_detector_x=axis_detector_x,
             axis_detector_y=axis_detector_y,

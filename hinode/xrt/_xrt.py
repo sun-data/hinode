@@ -1,3 +1,4 @@
+from typing import Literal
 import pathlib
 import astropy.time
 from ._filtergrams import Filtergram
@@ -19,6 +20,7 @@ def open(
     num_retry: int = 5,
     leak: bool = False,
     uncertainty: bool = False,
+    coalign: None | Literal["aia", "ufss"] = "aia",
 ) -> Filtergram:
     """
     Download the Level 1 XRT images which began during a given time range
@@ -58,6 +60,13 @@ def open(
         Whether to load :attr:`~hinode.xrt.Filtergram.vignetting` and
         :attr:`~hinode.xrt.Filtergram.uncertainty_map`,
         which :meth:`~hinode.xrt.Filtergram.uncertainty` needs.
+    coalign
+        Which co-alignment database of SolarSoft to correct the pointing of
+        the images with,
+        ``"aia"`` (the default) for the cross-correlation with AIA,
+        ``"ufss"`` for the Ultra Fine Sun Sensors,
+        or :obj:`None` to keep the pointing of the headers,
+        as in :meth:`~hinode.xrt.Filtergram.from_fits`.
     """
     return Filtergram.from_time_range(
         time_start=time_start,
@@ -71,4 +80,5 @@ def open(
         num_retry=num_retry,
         leak=leak,
         uncertainty=uncertainty,
+        coalign=coalign,
     )

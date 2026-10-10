@@ -17,6 +17,9 @@ the visible light leaking into each pixel,
 :attr:`hinode.xrt.Filtergram.leak`,
 and the uncertainty of each pixel,
 :meth:`hinode.xrt.Filtergram.uncertainty`.
+The pointing of each image is corrected with the co-alignment databases of
+SolarSoft, so that it lines up with AIA,
+:attr:`hinode.xrt.Filtergram.coalignment`.
 
 Installation
 ============
