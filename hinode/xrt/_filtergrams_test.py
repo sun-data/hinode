@@ -10,6 +10,7 @@ import astropy.io.fits
 import named_arrays as na
 import hinode
 from hinode.xrt._vignetting_test import _vignetting_numpy
+from hinode.xrt._coalign_test import _corrected
 
 _time_start = astropy.time.Time("2019-09-30T18:08:00")
 _time_stop = astropy.time.Time("2019-09-30T18:09:00")
@@ -118,6 +119,12 @@ def _num_saturated(header: astropy.io.fits.Header) -> int:
             axis_detector_y="y",
             leak=True,
             uncertainty=True,
+            coalign="ufss",
+        ),
+        hinode.xrt.Filtergram.from_time_range(
+            time_start=_time_start,
+            time_stop=_time_stop,
+            coalign=None,
         ),
     ],
 )
@@ -165,6 +172,21 @@ class TestFiltergram:
 
     def test_filter(self, array: hinode.xrt.Filtergram) -> None:
         assert array.filter == "Al_poly"
+
+    def test_coalignment(self, array: hinode.xrt.Filtergram) -> None:
+        coalignment = array.coalignment
+        if coalignment is None:
+            return
+        assert isinstance(coalignment, na.ScalarArray)
+        assert coalignment.shape == {array.axis_time: array.shape[array.axis_time]}
+
+        # The cross-correlation with AIA has every one of these images,
+        # and the UFSS database alone gives the pointing of the headers.
+        assert np.all(coalignment.ndarray == 1) or np.all(coalignment.ndarray == 3)
+
+        image = array[{array.axis_time: 0}]
+        assert image.coalignment is not None
+        assert image.coalignment.shape == {}
 
     def test_vignetting(self, array: hinode.xrt.Filtergram) -> None:
         vignetting = array.vignetting
@@ -563,17 +585,21 @@ def test_from_fits_history(
         hinode.xrt.Filtergram.from_fits(file)
 
 
-def test_inputs_against_astropy_wcs() -> None:
+@pytest.mark.parametrize("coalign", [None, "aia"])
+def test_inputs_against_astropy_wcs(coalign: None | str) -> None:
     """
     The coordinates of each pixel must be the ones :mod:`astropy.wcs`
-    makes of the header, which gives the roll as ``CROTA2``.
+    makes of the header, which gives the roll as ``CROTA2``,
+    once the pointing of the header is corrected.
     """
     path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
 
-    result = hinode.xrt.Filtergram.from_fits(path)
+    result = hinode.xrt.Filtergram.from_fits(path, coalign=coalign)
 
     header = astropy.io.fits.getheader(path)
     assert header["CROTA2"] != 0
+    if coalign is not None:
+        header, _ = _corrected(header, coalign)
 
     # Without the projection,
     # which :class:`named_arrays.AbstractWcsVector` does not apply.
