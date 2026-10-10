@@ -314,24 +314,24 @@ near the temperature of most of the plasma in the box.
 
 .. jupyter-execute::
 
-    # the temperatures AIA and XRT both constrain, log T from 5.5 to 7.5
+    # log T from 5.0 to 7.5, the temperatures of the inversion
     response_xrt = hinode.xrt.temperature_response(
         filter="Al_poly",
         time=xrt.inputs.time.ndarray,
         axis_filter="channel",
-    )[dict(temperature=slice(10, 51))]
+    )[dict(temperature=slice(0, 51))]
 
     variance_xrt = hinode.xrt.temperature_response(
         filter="Al_poly",
         time=xrt.inputs.time.ndarray,
         variance=True,
         axis_filter="channel",
-    )[dict(temperature=slice(10, 51))]
+    )[dict(temperature=slice(0, 51))]
 
     logt = np.log10(response_xrt.inputs / u.K)
 
     # F at log T = 6.3
-    noise_photon = (variance_xrt.outputs / response_xrt.outputs)[dict(temperature=16)]
+    noise_photon = (variance_xrt.outputs / response_xrt.outputs)[dict(temperature=26)]
 
     noise_photon
 
@@ -440,6 +440,21 @@ and that of Al_poly at the time of the image,
 both per steradian like the intensities.
 The response of AIA is per AIA pixel, whose solid angle is that of the
 registered pixels.
+The response of 94 Å includes the empirical correction of
+:cite:t:`Boerner2014` for the lines near 1 MK which CHIANTI is missing,
+``chiantifix=True``;
+without it the DEM predicts only about half of the 94 Å observed.
+
+The inversion runs from :math:`\log_{10} T = 5.0` to 7.5.
+The far wing of the passband of 335 Å takes in the bright lines of the
+transition region between 550 and 800 Å, O V 629.7 Å the brightest of them,
+so 335 Å responds more to plasma at :math:`\log_{10} T = 5.2` to 5.4 than at
+its peak of Fe XVI near 6.4,
+while the other channels respond to it at less than a fifth of their peaks.
+A DEM which starts at 5.5 has none of that plasma,
+and cannot make the 335 Å observed.
+Below 5.5 the DEM rests mostly on 335 Å,
+and its shape there on the smoothness of the inversion.
 
 .. jupyter-execute::
 
@@ -447,7 +462,8 @@ registered pixels.
         wavelength=channels,
         time=aia.inputs.time.ndarray.min(),
         eve=True,
-    )[dict(temperature=slice(30, 71))]
+        chiantifix=True,
+    )[dict(temperature=slice(20, 71))]
 
     solid_angle_aia = (plate_scale**2).to(u.sr)
 
@@ -539,7 +555,7 @@ The emission measure in each step of temperature is the DEM times the step in
         "AIA only": ratio_aia.median(),
     }
 
-In most of the box, the DEM from AIA alone predicts 8 to 23 times the XRT
+In most of the box, the DEM from AIA alone predicts 3 to 18 times the XRT
 intensity observed.
 AIA sees so little of the plasma above about 4 MK that the smoothest DEM which
 fits its six channels can have a tail of hot plasma there,
@@ -605,7 +621,7 @@ that AIA alone would put there.
 
 .. jupyter-execute::
 
-    constrained = dem[dict(temperature=slice(2, 35))]
+    constrained = dem[dict(temperature=slice(12, 45))]
 
     # in units of 10^27 cm^-5, so that the colorbar needs no offset
     dem_27 = (constrained.outputs / (1e27 / u.cm**5)).to(u.dimensionless_unscaled)
@@ -643,6 +659,8 @@ The DEM of the brightest pixel of the base and of a pixel in the spire,
 from AIA and XRT together and from AIA alone.
 The two agree on the plasma at 1 to 2 MK,
 and above about 3 MK AIA alone has the tail of hot plasma.
+At the base both have a second peak, near 0.35 MK,
+of the transition-region plasma which 335 Å sees.
 
 .. jupyter-execute::
 
@@ -682,23 +700,21 @@ and above about 3 MK AIA alone has the tail of hot plasma.
 How well the DEM fits:
 the reduced :math:`\chi^2` of each pixel,
 and the ratio of the XRT intensity the DEM predicts to the one observed.
-In most pixels the DEM predicts a little more than XRT observes.
+In every pixel the DEM predicts about 20% more than XRT observes.
 The inversion stops as soon as the reduced :math:`\chi^2` reaches one,
 and with seven channels that can leave one of them, here XRT,
 further from its observation than its uncertainty;
-a smaller ``chi2_target`` fits it more closely.
+a smaller ``chi2_target`` fits it a little more closely.
+The DEM also predicts about 20% less 94 Å than observed,
+even with the correction of :cite:t:`Boerner2014`.
 The two dark spots, where the ratio is largest,
 look like spots of contamination on the CCD which the Level 1 processing did
 not fill in.
-A few dozen pixels around the base of the jet fit poorly too,
-with a reduced :math:`\chi^2` above 3.
-AIA alone fits them, so AIA and XRT disagree there:
-the DEM which XRT allows predicts more 131, 171, 193, and 211 Å than AIA
-observes, and less 335 Å.
-Why is not known yet.
-It may be the wings of the point-spread function of XRT,
-which the blur of AIA does not match,
-the co-alignment, or the responses.
+Only one pixel, two from the brightest one of the base,
+has a reduced :math:`\chi^2` above 3.
+With the DEM starting at :math:`\log_{10} T = 5.5`, 119 do,
+26 of them around the base of the jet,
+where 335 Å sees the most plasma of the transition region.
 
 .. jupyter-execute::
 
