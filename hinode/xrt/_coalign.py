@@ -2,6 +2,8 @@ from typing import Sequence, Literal
 import re
 import time
 import pathlib
+import warnings
+import requests
 import numpy as np
 import hinode
 from ._data import _get, _path_local, _write, _download_file
@@ -24,10 +26,13 @@ The directory of each co-alignment database:
 and ``coaldb_u``, from the Ultra Fine Sun Sensors (UFSS) of Hinode.
 """
 
-_pattern_coalign = re.compile(r'href="(\d{8}_\d{4})\.geny"')
+_pattern_coalign = re.compile(
+    r'href="(\d{8}_\d{4})\.geny"(?:[^\n]*?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}))?'
+)
 """
 The name of a file of a co-alignment database in a listing of its directory,
-which is the start of the time it covers, as in ``20190930_1503.geny``.
+which is the start of the time it covers, as in ``20190930_1503.geny``,
+and when the file was last changed, if the listing shows it on the same line.
 """
 
 _name_listing = "listing.txt"
@@ -45,9 +50,27 @@ which is what a GENX file of SolarSoft is.
 
 _age_refresh = 86400
 """
-How old, in seconds, a downloaded listing or file of a database must be
-before it is downloaded again to look for images it may not have had yet,
-since the databases are updated about once a week.
+How old, in seconds, a listing of a database or the database of the roll
+must be before it is downloaded again to look for images it may not have had
+yet, since the databases are updated about once a week.
+"""
+
+_age_check = 30 * 86400
+"""
+How old, in seconds, a listing of a database or the database of the roll
+must be before it is downloaded again whatever the images,
+since the server sometimes changes files it has had for years,
+as it did for more than a thousand files of each database on one day in
+2015 and again in 2020.
+"""
+
+_errors_network = (
+    ConnectionError,
+    requests.exceptions.RequestException,
+)
+"""
+The errors of a download which mean the server could not be reached or
+refused it, so that a copy downloaded before can be used instead.
 """
 
 _tolerance = 0.1
@@ -116,7 +139,24 @@ def _start(names: Sequence[str]) -> np.ndarray:
     return _seconds(isot)
 
 
-def _stale(path: pathlib.Path) -> bool:
+def _isot(seconds: float) -> str:
+    """
+    A time in seconds since 1979 January 1 in the ISOT format,
+    the inverse of :func:`_seconds`.
+
+    Parameters
+    ----------
+    seconds
+        The time, counted as ``anytim`` counts it.
+    """
+    microseconds = np.timedelta64(round(seconds * 1e6), "us")
+    return str(np.datetime_as_string(_epoch + microseconds, unit="s"))
+
+
+def _stale(
+    path: pathlib.Path,
+    age: float = _age_refresh,
+) -> bool:
     """
     Whether a downloaded file is old enough to be downloaded again.
 
@@ -124,8 +164,55 @@ def _stale(path: pathlib.Path) -> bool:
     ----------
     path
         The file.
+    age
+        How old, in seconds, the file must be.
     """
-    return time.time() - path.stat().st_mtime > _age_refresh
+    return time.time() - path.stat().st_mtime > age
+
+
+def _download_database(
+    url: str,
+    directory: pathlib.Path,
+    overwrite: bool = False,
+    num_retry: int = 5,
+) -> pathlib.Path:
+    """
+    Download a file of a database to a directory,
+    unless it has been downloaded already,
+    and keep the copy downloaded before, with a warning,
+    if it cannot be downloaded again.
+
+    Parameters
+    ----------
+    url
+        The URL of the file.
+    directory
+        The directory to place the file in,
+        under the same path as on the server.
+    overwrite
+        Whether to download the file again if it is already in `directory`.
+    num_retry
+        The number of times to try to connect to the server.
+    """
+    path = _path_local(url, directory)
+    try:
+        return _download_file(
+            url=url,
+            directory=directory,
+            overwrite=overwrite,
+            num_retry=num_retry,
+            signature=_signature_genx,
+            kind="an IDL save file",
+        )
+    except _errors_network as e:
+        if not path.is_file():
+            raise
+        warnings.warn(
+            f"Could not download {url} again, "
+            f"so the copy downloaded before is used: {e!r}",
+            stacklevel=2,
+        )
+        return path
 
 
 def _restore(path: pathlib.Path) -> dict:
@@ -182,8 +269,9 @@ def _database_roll(
     the time of each measurement, in seconds since 1979 January 1,
     and the roll, in degrees, opposite in sign to ``CROTA2``.
 
-    It is downloaded again if an image is later than its last measurement,
-    unless it was downloaded less than :data:`_age_refresh` ago.
+    It is downloaded again if an image is later than its last measurement
+    and it was downloaded more than :data:`_age_refresh` ago,
+    or if it was downloaded more than :data:`_age_check` ago.
 
     Parameters
     ----------
@@ -198,18 +286,14 @@ def _database_roll(
     url = _url_coalign + "xrt_rollangle_db.geny"
     path = _path_local(url, directory)
 
-    refresh = False
-    if path.is_file() and _stale(path):
-        refresh = latest > _restore(path)["p0"][-1]
+    downloaded = path.is_file()
+    if downloaded:
+        variables = _restore(path)
+        after = latest > variables["p0"][-1]
+        if not ((after and _stale(path)) or _stale(path, _age_check)):
+            return variables["p0"].astype(float), variables["p1"].astype(float)
 
-    path = _download_file(
-        url=url,
-        directory=directory,
-        overwrite=refresh,
-        num_retry=num_retry,
-        signature=_signature_genx,
-        kind="an IDL save file",
-    )
+    path = _download_database(url, directory, downloaded, num_retry)
 
     variables = _restore(path)
     return variables["p0"].astype(float), variables["p1"].astype(float)
@@ -231,8 +315,9 @@ def _roll(
     The models and their ranges are those of ``xrt_rollangle.pro``,
     including its gap at exactly 2012 June 8 00:00,
     when the roll is zero,
-    and its linear extrapolation beyond the last measurement of the
-    database.
+    and its linear extrapolation beyond the first and the last measurement
+    of the database, which is done with a warning,
+    since the measurements reach the server days after the images.
 
     Parameters
     ----------
@@ -280,6 +365,16 @@ def _roll(
     if np.any(where):
         times, angles = _database_roll(t[where].max(), directory, num_retry)
         roll[where] = _interpol(t[where], times, angles)
+        outside = (t[where] < times[0]) | (t[where] > times[-1])
+        if np.any(outside):
+            warnings.warn(
+                f"{np.count_nonzero(outside)} of {t.size} images began "
+                f"outside the measurements of the roll, "
+                f"from {_isot(times[0])} to {_isot(times[-1])}, "
+                f"so their roll is extrapolated, "
+                f"as xrt_rollangle.pro extrapolates it, and may be wrong.",
+                stacklevel=3,
+            )
 
     return -roll
 
@@ -289,15 +384,23 @@ def _listing(
     latest: float,
     directory: pathlib.Path,
     num_retry: int = 5,
-) -> list[str]:
+) -> dict[str, float]:
     """
     The names of the files of a co-alignment database,
-    without their extension, in order of time.
+    without their extension, in order of time,
+    and when the listing first showed the version of each file the server
+    has now, from :func:`time.time`.
 
     The listing of the directory is kept in :data:`_name_listing`,
     and the directory is listed again if an image is later than the start of
-    the last file,
-    unless it was listed less than :data:`_age_refresh` ago.
+    the last file and it was listed more than :data:`_age_refresh` ago,
+    or if it was listed more than :data:`_age_check` ago.
+    A file whose time of change in the listing changes,
+    such as the last file as the database grows,
+    is given the time it was listed again,
+    so that a copy downloaded before then is downloaded again.
+    If the directory cannot be listed again,
+    the listing from before is used, with a warning.
 
     Parameters
     ----------
@@ -319,18 +422,49 @@ def _listing(
     url = f"{_url_coalign}{_directories_coalign[database]}/"
     path = _path_local(url + _name_listing, directory)
 
+    # The name of each file, when it was last changed, and when the listing
+    # first showed that change
+    before: dict[str, tuple[str, float]] = {}
     if path.is_file():
-        names = path.read_text().split()
-        if names and not (latest >= _start(names[-1:])[0] and _stale(path)):
-            return names
+        for line in path.read_text().splitlines():
+            name, changed, listed = line.split()
+            before[name] = (changed, float(listed))
 
-    names = sorted(set(_pattern_coalign.findall(_get(url, num_retry).text)))
-    if not names:
+    if before:
+        last = _start(list(before)[-1:])[0]
+        if not ((latest >= last and _stale(path)) or _stale(path, _age_check)):
+            return {name: listed for name, (_, listed) in before.items()}
+
+    try:
+        text = _get(url, num_retry).text
+    except _errors_network as e:
+        if not before:
+            raise
+        warnings.warn(
+            f"Could not list {url} again, so the listing from before is used: {e!r}",
+            stacklevel=2,
+        )
+        return {name: listed for name, (_, listed) in before.items()}
+
+    # A time of change the listing does not show is kept as "-"
+    found = {n: c.replace(" ", "T") or "-" for n, c in _pattern_coalign.findall(text)}
+    if not found:
         raise ValueError(f"The listing of {url} has no files of the database.")
 
-    _write(path, "\n".join(names).encode(), overwrite=True)
+    now = time.time()
+    result: dict[str, float] = {}
+    lines = []
+    for name in sorted(found):
+        changed = found[name]
+        changed_before, listed = before.get(name, ("", now))
+        if changed != changed_before:
+            listed = now
+        result[name] = listed
+        lines.append(f"{name} {changed} {listed!r}")
 
-    return names
+    _write(path, "\n".join(lines).encode(), overwrite=True)
+
+    return result
 
 
 def _lookup(
@@ -347,12 +481,12 @@ def _lookup(
     or NaN and -1 for an image the database has no entry for.
 
     Each file of the database covers the time from its start to the start of
-    the next one.
-    A file is downloaded again if an image later than its last entry has no
-    entry, since it may have been downloaded before the database reached the
-    image,
-    unless it was downloaded less than :data:`_age_refresh` ago.
-    An image before the last entry may have no entry of its own,
+    the next one,
+    and only the files which cover an image without an entry yet are read.
+    A file is downloaded again if the copy was downloaded before the listing
+    of :func:`_listing` showed the version the server has now,
+    as for the last file once the database has grown.
+    An image may have no entry,
     as an image the cross-correlation with AIA was not made for has none in
     ``coaldb_c``.
 
@@ -372,7 +506,8 @@ def _lookup(
     ycen = np.full(num, np.nan)
     ref_type = np.full(num, -1, dtype=int)
 
-    names = _listing(database, float(np.max(seconds)), directory, num_retry)
+    listed = _listing(database, float(np.max(seconds)), directory, num_retry)
+    names = list(listed)
     starts = _start(names)
 
     # The files which cover the time within the tolerance of each image
@@ -381,40 +516,56 @@ def _lookup(
 
     url_directory = f"{_url_coalign}{_directories_coalign[database]}/"
 
-    for i in range(max(int(first.min()), 0), int(last.max()) + 1):
-        images = (first <= i) & (i <= last)
-        if not np.any(images):
+    for i in np.unique(np.concatenate([first, last])):
+        images = np.flatnonzero((first <= i) & (i <= last) & (ref_type == -1))
+        if i < 0 or images.size == 0:
             continue
 
-        url = f"{url_directory}{names[i]}.geny"
+        name = names[i]
+        url = f"{url_directory}{name}.geny"
+        path = _path_local(url, directory)
+        overwrite = path.is_file() and path.stat().st_mtime < listed[name]
+        path = _download_database(url, directory, overwrite, num_retry)
 
-        refresh = False
-        while True:
-            path = _download_file(
-                url=url,
-                directory=directory,
-                overwrite=refresh,
-                num_retry=num_retry,
-                signature=_signature_genx,
-                kind="an IDL save file",
-            )
-            entries = _restore(path)["p0"]
-            times = _seconds([t.decode() for t in entries["DATE_OBS"]])
+        entries = _restore(path)["p0"]
+        times = _seconds([t.decode() for t in entries["DATE_OBS"]])
 
-            for j in np.flatnonzero(images & (ref_type == -1)):
-                difference = np.abs(times - seconds[j])
-                k = int(np.argmin(difference))
-                if difference[k] <= _tolerance:
-                    xcen[j] = entries["XCEN"][k]
-                    ycen[j] = entries["YCEN"][k]
-                    ref_type[j] = entries["REF_TYPE"][k]
-
-            missing = np.any(images & (ref_type == -1) & (seconds > times.max()))
-            if refresh or not missing or not _stale(path):
-                break
-            refresh = True
+        index, difference = _nearest(times, seconds[images])
+        match = difference <= _tolerance
+        images = images[match]
+        index = index[match]
+        xcen[images] = entries["XCEN"][index]
+        ycen[images] = entries["YCEN"][index]
+        ref_type[images] = entries["REF_TYPE"][index]
 
     return xcen, ycen, ref_type
+
+
+def _nearest(
+    times: np.ndarray,
+    seconds: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    The index of the entry nearest in time to each image,
+    the earlier one if two are as near,
+    and how far it is, in seconds.
+
+    Parameters
+    ----------
+    times
+        The time of each entry, in any order.
+    seconds
+        The start of each image.
+    """
+    order = np.argsort(times, kind="stable")
+    ordered = times[order]
+    position = np.searchsorted(ordered, seconds)
+    before = np.clip(position - 1, 0, ordered.size - 1)
+    after = np.clip(position, 0, ordered.size - 1)
+    difference_before = np.abs(ordered[before] - seconds)
+    difference_after = np.abs(ordered[after] - seconds)
+    nearest = np.where(difference_after < difference_before, after, before)
+    return order[nearest], np.minimum(difference_before, difference_after)
 
 
 def _calibration(ref_type: np.ndarray) -> np.ndarray:
@@ -433,6 +584,29 @@ def _calibration(ref_type: np.ndarray) -> np.ndarray:
     result[ref_type == 1] = 2
     result[ref_type == 5] = 4
     return result
+
+
+def _check_coalign(coalign: object) -> None:
+    """
+    Check that a co-alignment database is one of those of
+    :data:`_directories_coalign`,
+    so that a wrong one is found before any image is downloaded.
+
+    Parameters
+    ----------
+    coalign
+        The database, which :obj:`None` is not.
+
+    Raises
+    ------
+    ValueError
+        If `coalign` is not ``"aia"`` or ``"ufss"``.
+    """
+    if coalign not in tuple(_directories_coalign):
+        raise ValueError(
+            f"`coalign` must be one of {list(_directories_coalign)} or None, "
+            f"got {coalign!r}."
+        )
 
 
 def _coalign(
@@ -483,12 +657,16 @@ def _coalign(
         If :obj:`None` (the default), :data:`hinode.directory_default` is used.
     num_retry
         The number of times to try to connect to the server.
+
+    Raises
+    ------
+    ValueError
+        If `coalign` is not ``"aia"`` or ``"ufss"``.
+    ConnectionError
+        If a file of the databases which has not been downloaded before
+        cannot be downloaded.
     """
-    if coalign not in _directories_coalign:
-        raise ValueError(
-            f"`coalign` must be one of {list(_directories_coalign)} or None, "
-            f"got {coalign!r}."
-        )
+    _check_coalign(coalign)
 
     root: pathlib.Path = hinode.directory_default if directory is None else directory
 
@@ -502,16 +680,23 @@ def _coalign(
     xcen = np.full(num, np.nan)
     ycen = np.full(num, np.nan)
     calibration = np.full(num, -1, dtype=int)
-    for database in databases:
-        missing = calibration == -1
-        if not np.any(missing):
-            break
-        x, y, ref_type = _lookup(database, seconds[missing], root, num_retry)
-        xcen[missing] = x
-        ycen[missing] = y
-        calibration[missing] = _calibration(ref_type)
+    try:
+        for database in databases:
+            missing = calibration == -1
+            if not np.any(missing):
+                break
+            x, y, ref_type = _lookup(database, seconds[missing], root, num_retry)
+            xcen[missing] = x
+            ycen[missing] = y
+            calibration[missing] = _calibration(ref_type)
 
-    roll = _roll(seconds, root, num_retry)
+        roll = _roll(seconds, root, num_retry)
+    except _errors_network as e:
+        raise ConnectionError(
+            f"Could not download the co-alignment databases of SolarSoft "
+            f"from {_url_coalign}. "
+            f"Pass coalign=None to keep the pointing of the headers."
+        ) from e
 
     keywords: list[dict[str, float | str]] = []
     for i in range(num):

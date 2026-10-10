@@ -14,7 +14,7 @@ from ._data import _filter, _history
 from ._leak import _leak, _history_leak
 from ._uncertainty import _quality, _error_jpeg, _error_dark
 from ._vignetting import _vignetting, _error_vignetting
-from ._coalign import _coalign
+from ._coalign import _check_coalign, _coalign
 
 __all__ = [
     "Filtergram",
@@ -288,7 +288,8 @@ class Filtergram(
     4 for a fit to the limb in X-rays,
     6 for another method,
     and -1 for an image no database had an entry for,
-    which keeps the pointing of its header,
+    which keeps the center and the plate scale of its header
+    but is still given the roll of ``xrt_rollangle.pro``,
     or :obj:`None` if the pointing was not corrected.
     """
 
@@ -362,7 +363,19 @@ class Filtergram(
             as ``xrt_read_coaldb.pro`` does with ``/aia_cc``.
             ``"ufss"`` uses the UFSS alone, as it does by default.
             See :attr:`coalignment`.
+
+        Raises
+        ------
+        ValueError
+            If `coalign` is not ``"aia"``, ``"ufss"``, or :obj:`None`,
+            which is checked before any image is downloaded,
+            or for the reasons :meth:`from_fits` gives.
+        ConnectionError
+            For the reasons :meth:`from_fits` gives.
         """
+        if coalign is not None:
+            _check_coalign(coalign)
+
         urls = hinode.xrt.urls(
             time_start=time_start,
             time_stop=time_stop,
@@ -466,6 +479,10 @@ class Filtergram(
             if `uncertainty` is :obj:`True` and the compression of an
             image is not known,
             or if `coalign` is not ``"aia"``, ``"ufss"``, or :obj:`None`.
+        ConnectionError
+            If a file of the co-alignment databases an image needs has not
+            been downloaded before and cannot be downloaded,
+            in which case ``coalign=None`` keeps the pointing of the headers.
 
         Notes
         -----
@@ -491,7 +508,24 @@ class Filtergram(
         the correction places the center the database gives at pixel
         ``NAXIS // 2 + 0.5``, counted from one,
         with the plate scale of the X-ray or the G-band images.
+
+        The files of the databases are downloaded to `directory` the first
+        time an image needs them.
+        They are downloaded again when the listing of the server shows they
+        have changed,
+        and the listings and the database of the roll are checked again after
+        a day for an image later than they reach,
+        and after a month for any image.
+        If the server cannot be reached,
+        the copies downloaded before are used, with a warning.
+        A warning is also given for an image the database of the roll does
+        not reach yet,
+        since it is extrapolated, as ``xrt_rollangle.pro`` extrapolates it,
+        and the measurements reach the server days after the images.
         """
+        if coalign is not None:
+            _check_coalign(coalign)
+
         if isinstance(path, na.AbstractScalarArray):
             path = [str(p) for p in np.ravel(np.asarray(path.ndarray))]
         elif isinstance(path, (str, os.PathLike)):

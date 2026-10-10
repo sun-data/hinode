@@ -1,6 +1,7 @@
 import re
 import pathlib
 import dataclasses
+import unittest.mock
 import pytest
 import numpy as np
 import astropy.units as u
@@ -180,14 +181,6 @@ class TestFiltergram:
         assert isinstance(coalignment, na.ScalarArray)
         assert coalignment.shape == {array.axis_time: array.shape[array.axis_time]}
 
-        # The cross-correlation with AIA has every one of these images,
-        # and the UFSS database alone gives the pointing of the headers.
-        assert np.all(coalignment.ndarray == 1) or np.all(coalignment.ndarray == 3)
-
-        image = array[{array.axis_time: 0}]
-        assert image.coalignment is not None
-        assert image.coalignment.shape == {}
-
     def test_vignetting(self, array: hinode.xrt.Filtergram) -> None:
         vignetting = array.vignetting
         if vignetting is None:
@@ -235,7 +228,7 @@ class TestFiltergram:
         assert result.saturated is not None
         assert array.saturated is not None
         assert np.all(result.saturated == array.saturated[index])
-        for name in ["vignetting", "uncertainty_map", "leak"]:
+        for name in ["vignetting", "uncertainty_map", "leak", "coalignment"]:
             field = getattr(array, name)
             if field is not None:
                 assert np.all(getattr(result, name) == field[index])
@@ -583,6 +576,61 @@ def test_from_fits_history(
     file = _write(tmp_path / "a.fits", history=history)
     with pytest.raises(ValueError, match=re.escape(match)):
         hinode.xrt.Filtergram.from_fits(file)
+
+
+@pytest.mark.parametrize(
+    argnames="coalign,expected",
+    argvalues=[
+        ("aia", 1),
+        ("ufss", 3),
+        (None, None),
+    ],
+)
+def test_from_fits_coalign(coalign: None | str, expected: None | int) -> None:
+    """
+    The cross-correlation with AIA has an entry for this image,
+    and the UFSS database alone gives the pointing of its header.
+    """
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    result = hinode.xrt.Filtergram.from_fits(path, coalign=coalign)  # type: ignore[arg-type]
+    if expected is None:
+        assert result.coalignment is None
+    else:
+        assert result.coalignment is not None
+        assert result.coalignment.ndarray.tolist() == [expected]
+
+
+def test_from_fits_coalign_directory(tmp_path: pathlib.Path) -> None:
+    """The co-alignment databases are placed in the directory given."""
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    hinode.xrt.Filtergram.from_fits(path, coalign="ufss", directory=tmp_path)
+    database = tmp_path / "sdb/hinode/xrt/xrt_msu_coalign/coaldb_u"
+    assert (database / "listing.txt").is_file()
+    assert len(list(database.glob("*.geny"))) == 1
+
+
+def test_from_time_range_coalign_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrong database is found before the archive is searched."""
+    urls = unittest.mock.Mock()
+    monkeypatch.setattr(hinode.xrt, "urls", urls)
+
+    with pytest.raises(ValueError, match="`coalign` must be one of"):
+        hinode.xrt.Filtergram.from_time_range(
+            time_start=_time_start,
+            time_stop=_time_stop,
+            coalign="AIA",  # type: ignore[arg-type]
+        )
+
+    urls.assert_not_called()
+
+
+def test_from_fits_coalign_invalid(tmp_path: pathlib.Path) -> None:
+    """A wrong database is found before the files are read."""
+    with pytest.raises(ValueError, match="`coalign` must be one of"):
+        hinode.xrt.Filtergram.from_fits(
+            tmp_path / "missing.fits",
+            coalign="AIA",  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("coalign", [None, "aia"])
