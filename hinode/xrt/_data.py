@@ -472,6 +472,120 @@ def _replace(
     os.replace(source, destination)
 
 
+def _path_local(
+    url: str,
+    directory: pathlib.Path,
+) -> pathlib.Path:
+    """
+    Where a file on a server is placed under a directory,
+    at the same path as on the server.
+
+    Parameters
+    ----------
+    url
+        The URL of the file.
+    directory
+        The directory to place the file in.
+
+    Raises
+    ------
+    ValueError
+        If the URL is not that of a file.
+    """
+    relative = "/".join(url.split("/")[3:])
+    if not relative or relative.endswith("/"):
+        raise ValueError(f"{url} is not the URL of a file.")
+    return directory / relative
+
+
+def _write(
+    path: pathlib.Path,
+    content: bytes,
+    overwrite: bool,
+) -> None:
+    """
+    Write a file, so that an interrupted write never leaves it half written.
+
+    Parameters
+    ----------
+    path
+        The file to write.
+    content
+        What to write to it.
+    overwrite
+        Whether the new file must replace one which another process has open,
+        rather than keeping that one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Written next to its final place, under a name no other download
+    # uses, and then moved, so an interrupted download never looks
+    # finished.
+    # It is made with :func:`open` rather than :mod:`tempfile`,
+    # so that it has the permissions the umask gives a new file.
+    part = path.with_name(f"{path.name}.{uuid.uuid4().hex}.part")
+    try:
+        with open(part, "xb") as file:
+            file.write(content)
+        try:
+            _replace(part, path)
+        except PermissionError:
+            # Another process may have downloaded the file first and
+            # still have it open, in which case its copy is kept,
+            # unless a new copy was asked for.
+            if overwrite or not path.is_file():
+                raise
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def _download_file(
+    url: str,
+    directory: pathlib.Path,
+    overwrite: bool = False,
+    num_retry: int = 5,
+    signature: bytes = _signature_fits,
+    kind: str = "a FITS file",
+) -> pathlib.Path:
+    """
+    Download a file to a directory, unless it has been downloaded already,
+    and check that it starts the way a file of its kind does.
+
+    Parameters
+    ----------
+    url
+        The URL to download.
+    directory
+        The directory to place the file in,
+        under the same path as on the server.
+    overwrite
+        Boolean flag controlling whether to download the file if it is
+        already in `directory`.
+    num_retry
+        The number of times to try to connect to the server.
+    signature
+        The first bytes of every file of its kind.
+    kind
+        The kind of file, for the error message.
+
+    Raises
+    ------
+    ValueError
+        If the file does not start with `signature`.
+    """
+    path = _path_local(url, directory)
+
+    if overwrite or not path.is_file():
+        content = _get(url, num_retry).content
+
+        if not content.startswith(signature):
+            raise ValueError(f"{url} is not {kind}, it starts with {content[:40]!r}.")
+
+        _write(path, content, overwrite)
+
+    return path
+
+
 def download(
     urls: na.AbstractScalarArray,
     directory: None | pathlib.Path = None,
@@ -517,48 +631,12 @@ def download(
 
         hinode.xrt.download(urls)
     """
-    if directory is None:
-        directory = hinode.directory_default
+    root: pathlib.Path = hinode.directory_default if directory is None else directory
 
     ndarray = np.asarray(urls.ndarray)
 
     def get(url: str) -> str:
-        relative = "/".join(url.split("/")[3:])
-        if not relative or relative.endswith("/"):
-            raise ValueError(f"{url} is not the URL of a file.")
-        path = directory / relative
-
-        if overwrite or not path.is_file():
-            content = _get(url, num_retry).content
-
-            if not content.startswith(_signature_fits):
-                raise ValueError(
-                    f"{url} is not a FITS file, it starts with {content[:40]!r}."
-                )
-
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Written next to its final place, under a name no other download
-            # uses, and then moved, so an interrupted download never looks
-            # finished.
-            # It is made with :func:`open` rather than :mod:`tempfile`,
-            # so that it has the permissions the umask gives a new file.
-            part = path.with_name(f"{path.name}.{uuid.uuid4().hex}.part")
-            try:
-                with open(part, "xb") as file:
-                    file.write(content)
-                try:
-                    _replace(part, path)
-                except PermissionError:
-                    # Another process may have downloaded the file first and
-                    # still have it open, in which case its copy is kept,
-                    # unless a new copy was asked for.
-                    if overwrite or not path.is_file():
-                        raise
-            finally:
-                part.unlink(missing_ok=True)
-
-        return str(path)
+        return str(_download_file(url, root, overwrite, num_retry))
 
     # Each URL is downloaded once, even if it is given more than once.
     unique = list(dict.fromkeys(str(url) for url in ndarray.flat))

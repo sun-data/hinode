@@ -36,12 +36,9 @@ The uncertainty map is loaded too, for the uncertainty of each pixel below.
 .. jupyter-execute::
 
     import numpy as np
-    import scipy.io
     import matplotlib.pyplot as plt
     import matplotlib.colors
     import astropy.units as u
-    import astropy.time
-    import astropy.utils.data
     import astropy.visualization
     import sunpy.visualization.colormaps
     import named_arrays as na
@@ -76,39 +73,15 @@ arcsecond.
 :cite:t:`Yoshimura2015` cross-correlated the XRT images with AIA,
 and SolarSoft keeps the result for each image in a database,
 as the position of the center of the image.
-Moving the center there, as ``xrt_read_coaldb`` does in SolarSoft,
-aligns XRT with AIA.
-The database is split into files by time,
-and this image is in the one which starts at 15:03.
+:func:`hinode.xrt.open` moves the center there by default,
+as ``xrt_read_coaldb`` does in SolarSoft with ``/aia_cc``,
+which aligns XRT with AIA,
+and :attr:`~hinode.xrt.Filtergram.coalignment` records how each image was
+aligned, 1 for the cross-correlation with AIA.
 
 .. jupyter-execute::
 
-    url = (
-        "https://sohoftp.nascom.nasa.gov/sdb/hinode/xrt/"
-        "xrt_msu_coalign/coaldb_c/20190930_1503.geny"
-    )
-    path = astropy.utils.data.download_file(url, cache=True)
-    database = scipy.io.readsav(path)["p0"]
-
-    # the entry of this image
-    time = astropy.time.Time([t.decode() for t in database.date_obs])
-    i = np.argmin(np.abs((time - xrt.inputs.time.ndarray).to(u.s)))
-
-    # the center of the image, the mean of the corners of its pixels
-    center = xrt.inputs.position.mean((xrt.axis_detector_x, xrt.axis_detector_y))
-
-    shift = na.Cartesian2dVectorArray(
-        x=database.xcen[i] * u.arcsec - center.x,
-        y=database.ycen[i] * u.arcsec - center.y,
-    )
-
-    xrt = xrt.replace(
-        inputs=xrt.inputs.replace(
-            crval=xrt.inputs.crval + na.PositionalVectorArray(shift),
-        ),
-    )
-
-    shift
+    xrt.coalignment
 
 Select a 128-pixel box around the jet.
 
