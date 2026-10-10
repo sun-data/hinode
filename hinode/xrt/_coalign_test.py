@@ -13,6 +13,7 @@ from hinode.xrt._coalign import (
     _start,
     _interpol,
     _roll,
+    _database_roll,
     _listing,
     _lookup,
     _calibration,
@@ -21,6 +22,7 @@ from hinode.xrt._coalign import (
     _name_listing,
     _url_coalign,
 )
+from hinode.xrt._data import _path_local
 
 _date_obs = "2019-09-30T18:08:00.577"
 """The start of the Al_poly image which the tutorial inverts for a DEM."""
@@ -331,3 +333,87 @@ def test_lookup_refresh(
 
     assert downloads == [False, True][:num_downloads]
     assert ref_type[0] == (10 if num_downloads == 2 else -1)
+
+
+@pytest.mark.parametrize(
+    argnames="latest,stale,overwrite",
+    argvalues=[
+        # After the last measurement, in a database downloaded long ago
+        (20.0, True, True),
+        # Within the database
+        (5.0, True, False),
+        # After the last measurement, in a new database
+        (20.0, False, False),
+    ],
+)
+def test_database_roll_refresh(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    latest: float,
+    stale: bool,
+    overwrite: bool,
+) -> None:
+    """
+    The database of the roll is downloaded again only for an image after its
+    last measurement, and only if it is old.
+    """
+    path = _path_local(_url_coalign + "xrt_rollangle_db.geny", tmp_path)
+    path.parent.mkdir(parents=True)
+    path.touch()
+
+    downloads = []
+
+    def download_file(
+        url: str, directory: pathlib.Path, overwrite: bool, **kwargs: object
+    ) -> pathlib.Path:
+        downloads.append(overwrite)
+        return path
+
+    def restore(path: pathlib.Path) -> dict:
+        return {"p0": np.array([0.0, 10.0]), "p1": np.array([1.0, 2.0])}
+
+    monkeypatch.setattr(hinode.xrt._coalign, "_download_file", download_file)
+    monkeypatch.setattr(hinode.xrt._coalign, "_restore", restore)
+    monkeypatch.setattr(hinode.xrt._coalign, "_stale", lambda path: stale)
+
+    times, angles = _database_roll(latest, tmp_path)
+
+    assert downloads == [overwrite]
+    assert np.all(times == [0, 10]) and np.all(angles == [1, 2])
+
+
+def test_lookup_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Only the files which cover an image are downloaded,
+    and not the ones between them.
+    """
+    isot = ["2019-09-30T00:30:00.000", "2019-09-30T02:30:00.000"]
+    downloads = []
+
+    def download_file(url: str, directory: pathlib.Path, **kwargs: object) -> str:
+        downloads.append(url.split("/")[-1])
+        return url
+
+    def restore(path: str) -> dict:
+        times = [t for t in isot if t[11:13] == path.split("_")[-1][:2]]
+        num = len(times)
+        entries = np.rec.fromarrays(
+            [
+                np.array([t.encode() for t in times]),
+                np.ones(num),
+                np.ones(num),
+                np.full(num, 3),
+            ],
+            names=["DATE_OBS", "XCEN", "YCEN", "REF_TYPE"],
+        )
+        return {"p0": entries}
+
+    names = ["20190930_0000", "20190930_0100", "20190930_0200"]
+    monkeypatch.setattr(hinode.xrt._coalign, "_listing", lambda *args: names)
+    monkeypatch.setattr(hinode.xrt._coalign, "_download_file", download_file)
+    monkeypatch.setattr(hinode.xrt._coalign, "_restore", restore)
+
+    _, _, ref_type = _lookup("ufss", _seconds(isot), pathlib.Path("cache"))
+
+    assert downloads == ["20190930_0000.geny", "20190930_0200.geny"]
+    assert ref_type.tolist() == [3, 3]
