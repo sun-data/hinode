@@ -219,11 +219,12 @@ better than their noise warrants, and XRT worse.
 
     reduction
 
-The pixels of AIA and XRT have different sizes,
-so the intensities of both are divided by the solid angle of a pixel,
-and are per steradian.
-The AIA images are now on the XRT pixels,
-so they are divided by the solid angle of an XRT pixel.
+The regridded AIA images are now in counts per XRT pixel, like XRT,
+but the responses of AIA below are per AIA pixel.
+So that the images and the responses can be compared,
+the images of every channel are divided by the solid angle of an XRT pixel,
+and each response by the solid angle of its own pixels,
+which puts both per steradian.
 
 .. jupyter-execute::
 
