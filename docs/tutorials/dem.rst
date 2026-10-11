@@ -630,7 +630,8 @@ that AIA alone would put there.
         axs[1].yaxis.set_label_position("right")
 
 The DEM of the brightest pixel of the base and of a pixel in the spire,
-from AIA and XRT together and from AIA alone.
+from AIA and XRT together and from AIA alone,
+with both pixels marked on the XRT image.
 The two agree on the plasma at 1 to 2 MK,
 and above about 3 MK AIA alone has the tail of hot plasma.
 At the base both have a second peak, near 0.35 MK,
@@ -643,6 +644,9 @@ of the transition-region plasma which 335 Å sees.
 
     pixels = dict(base=base, spire=spire)
 
+    # the center of each pixel, from its corners
+    center = position_xrt.cell_centers(axis=("detector_x", "detector_y"))
+
     inversions = [
         ("AIA + XRT", dem, chi2),
         ("AIA only", dem_aia, chi2_aia),
@@ -650,12 +654,40 @@ of the transition-region plasma which 335 Å sees.
 
     with astropy.visualization.quantity_support():
         fig, axs = plt.subplots(
-            ncols=2,
-            figsize=(9, 4),
-            sharey=True,
+            ncols=3,
+            figsize=(13, 4),
             constrained_layout=True,
         )
-        for ax, (title, index) in zip(axs, pixels.items()):
+        na.plt.pcolormesh(
+            position_xrt,
+            C=intensity_xrt.value,
+            ax=axs[0],
+            cmap="hinodexrt",
+            norm=matplotlib.colors.PowerNorm(
+                gamma=0.5,
+                vmin=0,
+                vmax=intensity_xrt.value.percentile(99.9).ndarray,
+            ),
+        )
+        # the labels to the right of the jet, the spire's above the base's
+        offsets = dict(base=-20, spire=20)
+        for title, index in pixels.items():
+            na.plt.annotate(
+                text=title,
+                xy=center[index],
+                xytext=na.Cartesian2dVectorArray(40, offsets[title]),
+                textcoords="offset points",
+                ax=axs[0],
+                color="cyan",
+                va="center",
+                arrowprops=dict(arrowstyle="->", color="cyan"),
+            )
+        axs[0].set_title("XRT Al_poly")
+        axs[0].set_aspect("equal")
+        axs[0].set_xlabel("helioprojective $x$ (arcsec)")
+        axs[0].set_ylabel("helioprojective $y$ (arcsec)")
+        axs[2].sharey(axs[1])
+        for ax, (title, index) in zip(axs[1:], pixels.items()):
             for label, d, c in inversions:
                 na.plt.plot(
                     d.inputs,
@@ -669,7 +701,9 @@ of the transition-region plasma which 335 Å sees.
             ax.set_title(title)
             ax.set_xlabel(f"temperature ({dem.inputs.unit:latex_inline})")
             ax.legend()
-        axs[0].set_ylabel(rf"DEM ({dem.outputs.unit:latex_inline} per unit $\log_{{10}} T$)")
+        axs[1].set_ylabel(rf"DEM ({dem.outputs.unit:latex_inline} per unit $\log_{{10}} T$)")
+        axs[2].set_ylabel("")
+        axs[2].tick_params(labelleft=False)
 
 How well the DEM fits:
 the reduced :math:`\chi^2` of each pixel,
