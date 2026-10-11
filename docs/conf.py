@@ -78,4 +78,7 @@ intersphinx_mapping = {
     "astropy": ("https://docs.astropy.org/en/stable/", None),
     "named_arrays": ("https://named-arrays.readthedocs.io/en/stable/", None),
     "xrtpy": ("https://xrtpy.readthedocs.io/en/stable/", None),
+    "sunpy": ("https://docs.sunpy.org/en/stable/", None),
+    "sdo": ("https://sdo.readthedocs.io/en/latest/", None),
+    "utu": ("https://utu.readthedocs.io/en/latest/", None),
 }
