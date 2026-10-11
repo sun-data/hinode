@@ -777,3 +777,96 @@ def test_from_time_range_no_images() -> None:
             time_start="2019-09-30T18:08:01",
             time_stop="2019-09-30T18:08:02",
         )
+
+
+def _sequence(
+    ratio: float,
+    num: int = 4,
+    signal: float = 3,
+    seed: int = 0,
+) -> tuple[hinode.xrt.Filtergram, u.Quantity]:
+    """
+    A sequence of `num` flat images of the given `signal`, in DN per second,
+    with noise whose variance is `ratio` times that of
+    :meth:`hinode.xrt.Filtergram.uncertainty`, and the photon noise factor
+    the uncertainty was computed with.
+    """
+    path = _path("2019-09-30T18:08:30", "2019-09-30T18:08:40")
+    paths = na.ScalarArray(np.array([path] * num, dtype=object), axes="time")
+    images = hinode.xrt.Filtergram.from_fits(paths, uncertainty=True)
+    noise_photon = 2.5 * u.DN / u.ph
+    flat = na.ScalarArray.ones(images.outputs.shape) * signal * u.DN / u.s
+    images = dataclasses.replace(images, outputs=flat)
+    sigma = images.uncertainty(noise_photon)
+    noise = na.random.normal(0, 1, shape_random=flat.shape, seed=seed)
+    outputs = flat + np.sqrt(ratio) * sigma * noise
+    return dataclasses.replace(images, outputs=outputs), noise_photon
+
+
+def test_ratio_noise() -> None:
+    """The ratio is the variance of the noise of the images over their uncertainty."""
+    images, noise_photon = _sequence(ratio=0.2)
+    result = images.ratio_noise(noise_photon)
+    assert result.shape == dict()
+    assert np.isclose(result.ndarray, 0.2, rtol=0.02)
+
+
+def test_ratio_noise_pairs() -> None:
+    """
+    Images are compared only with the next one, and only if it was taken soon
+    after with the same exposure.
+    """
+    images, noise_photon = _sequence(ratio=0.2, num=5)
+    noisy, _ = _sequence(ratio=50, num=5, seed=1)
+
+    time = images.inputs.time.ndarray + [0, 18, 36, 54, 100] * u.s
+    timedelta = na.ScalarArray([16.4, 16.4, 11.6, 16.4, 16.4] * u.s, axes="time")
+    # Only the first two images are compared: the third has another
+    # exposure than its neighbors, and the last begins long after the fourth.
+    outputs = images.outputs.copy()
+    for i in (2, 4):
+        outputs[dict(time=i)] = noisy.outputs[dict(time=i)]
+
+    images = dataclasses.replace(
+        images,
+        inputs=images.inputs.replace(time=na.ScalarArray(time, axes="time")),
+        outputs=outputs,
+        timedelta=timedelta,
+    )
+
+    result = images.ratio_noise(noise_photon)
+    assert np.isclose(result.ndarray, 0.2, rtol=0.05)
+
+    # a longer gap lets the last two be compared
+    assert images.ratio_noise(noise_photon, gap=60 * u.s).ndarray > 1
+
+
+def test_ratio_noise_excluded() -> None:
+    """
+    Cosmic rays are clipped, and pixels which are bright or not selected are
+    left out.
+    """
+    images, noise_photon = _sequence(ratio=0.2)
+    bright, _ = _sequence(ratio=2, signal=12, seed=1)
+
+    outputs = images.outputs.copy()
+    # cosmic rays
+    outputs[dict(time=1, detector_x=slice(10, 13))] = 9 * u.DN / u.s
+    # a region brighter than the threshold, and noisier
+    region = dict(detector_x=slice(100, 150))
+    outputs[region] = bright.outputs[region]
+    # a region which brightens a little, left out by `where`
+    region = dict(time=3, detector_x=slice(200, 250))
+    outputs[region] = outputs[region] + 1 * u.DN / u.s
+    images = dataclasses.replace(images, outputs=outputs)
+
+    index_x = na.arange(0, images.outputs.shape["detector_x"], axis="detector_x")
+    where = (index_x < 200) | (index_x >= 250)
+
+    result = images.ratio_noise(noise_photon, where=where)
+    assert np.isclose(result.ndarray, 0.2, rtol=0.02)
+
+    assert images.ratio_noise(noise_photon).ndarray > 0.22
+    threshold = 100 * u.DN / u.s
+    assert images.ratio_noise(noise_photon, where, threshold).ndarray > 0.22
+    assert images.ratio_noise(noise_photon, where, num_iteration=0).ndarray > 0.22

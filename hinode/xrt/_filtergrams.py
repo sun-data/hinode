@@ -931,3 +931,126 @@ class Filtergram(
         variance = variance + np.square(self.uncertainty_map)
 
         return typing.cast(na.ScalarArray, np.sqrt(variance))
+
+    def ratio_noise(
+        self,
+        noise_photon: u.Quantity | na.AbstractScalar,
+        where: bool | na.AbstractScalar = True,
+        threshold: u.Quantity = 10 * u.DN / u.s,
+        gap: u.Quantity = 25 * u.s,
+        clip: float = 5,
+        num_iteration: int = 3,
+    ) -> na.ScalarArray:
+        r"""
+        The ratio of the variance of the noise measured in this sequence of
+        images to the variance of :meth:`uncertainty`.
+
+        The noise is measured from the difference between each image and the
+        next.
+        Where the Sun barely changes between the two,
+        the difference is the noise of both images,
+        and dividing it by their uncertainties,
+
+        .. math::
+
+            z = \frac{I_2 - I_1}{\sqrt{\sigma_1^2 + \sigma_2^2}},
+
+        gives a quantity whose variance is the ratio.
+        Only images taken within `gap` of each other with the same exposure
+        time are compared,
+        and only the pixels selected by `where` which are fainter than
+        `threshold` in both,
+        since brighter ones are more likely to change.
+        Cosmic rays are left out by clipping :math:`z` at `clip` times the
+        square root of the ratio, which is repeated `num_iteration` times.
+
+        The noise of the images of XRT is less than :meth:`uncertainty`
+        predicts,
+        since the charge of each photon diffuses into the neighboring pixels
+        and the compression of the images removes some of the noise,
+        so this ratio can scale :meth:`uncertainty` to the noise measured.
+        It is measured in faint pixels,
+        and compression removes less of the noise of brighter ones.
+
+        Parameters
+        ----------
+        noise_photon
+            The factor which sets the photon noise, as in :meth:`uncertainty`.
+        where
+            The pixels to measure the noise in, which should leave out any
+            which change between images, such as those of a jet.
+        threshold
+            The signal above which pixels are left out.
+        gap
+            The longest time between the starts of two images compared.
+        clip
+            How many times the measured noise a difference may be before it
+            is left out.
+        num_iteration
+            How many times to clip the differences.
+
+        Examples
+        --------
+
+        The ratio for the Al_poly images captured while ESIS was observing
+        the Sun, with the photon noise of plasma at 2 MK.
+
+        .. jupyter-execute::
+
+            import numpy as np
+            import astropy.units as u
+            import hinode
+
+            images = hinode.xrt.open(
+                time_start="2019-09-30T18:06:11",
+                time_stop="2019-09-30T18:11:01",
+                leak=True,
+                uncertainty=True,
+            ).remove_leak()
+
+            time = images.inputs.time.ndarray[0]
+            response = hinode.xrt.temperature_response("Al_poly", time)
+            variance = hinode.xrt.temperature_response("Al_poly", time, variance=True)
+
+            # The temperature closest to 2 MK
+            index = dict(
+                filter=0,
+                temperature=int(np.argmin(np.abs(response.inputs.ndarray - 2 * u.MK))),
+            )
+            noise_photon = (variance.outputs / response.outputs)[index]
+
+            images.ratio_noise(noise_photon)
+        """
+        axis = self.axis_time
+        before = {axis: slice(None, ~0)}
+        after = {axis: slice(1, None)}
+
+        intensity = self.outputs
+        uncertainty = self.uncertainty(noise_photon)
+
+        time = typing.cast(na.ScalarArray, self.inputs.time)
+        t = typing.cast(astropy.time.Time, time.ndarray)
+        mjd = typing.cast(np.ndarray, t.mjd)
+        interval = na.ScalarArray(np.diff(mjd) * u.day, axes=time.axes)
+        change = np.abs(self.timedelta[after] - self.timedelta[before])
+        consecutive = (interval < gap) & (change < 0.01 * u.s)
+
+        quiet = (
+            consecutive
+            & where
+            & (intensity[before] < threshold)
+            & (intensity[after] < threshold)
+        )
+
+        difference = intensity[after] - intensity[before]
+        z = difference / np.sqrt(
+            np.square(uncertainty[after]) + np.square(uncertainty[before])
+        )
+        z = z.to(u.dimensionless_unscaled).value
+
+        ratio = np.square(z).mean(where=quiet)
+        for _ in range(num_iteration):
+            clipped = quiet & (np.abs(z) < clip * np.sqrt(ratio))
+            ratio = np.square(z).mean(where=clipped)
+
+        return typing.cast(na.ScalarArray, ratio)
