@@ -312,7 +312,8 @@ near the temperature of most of the plasma in the box.
 That is the noise of a CCD which collects all the charge of each photon in the
 pixel it was absorbed in, before any compression.
 The noise of these images can be measured instead,
-from the difference between each image and the next.
+from the difference between each image and the next,
+with :meth:`~hinode.xrt.Filtergram.ratio_noise`.
 Away from the jet the Sun barely changes in 18 seconds,
 so the difference is the noise of the two images,
 and dividing it by their uncertainties gives a quantity whose variance is the
@@ -324,49 +325,43 @@ and so are cosmic rays, by clipping at five times the noise.
 
     frames = images.remove_leak()
 
-    intensity_frames = frames.outputs
-    uncertainty_frames = frames.uncertainty(noise_photon)
-
-    # each image and the one after it
-    before = dict(time=slice(None, ~0))
-    after = dict(time=slice(1, None))
-
-    # pairs of images taken one after the other with the same exposure
-    time_frames = images.inputs.time.ndarray
-    gap = na.ScalarArray((time_frames[1:] - time_frames[:-1]).to(u.s), axes="time")
-    change = np.abs(images.timedelta[after] - images.timedelta[before])
-    consecutive = (gap < 25 * u.s) & (change < 0.01 * u.s)
-
     in_box = na.ScalarArray.zeros(images.outputs[dict(time=0)].shape) > 0
     in_box[box] = True
 
-    bright = 10 * u.DN / u.s
-    quiet = (
-        consecutive
-        & ~in_box
-        & (intensity_frames[before] < bright)
-        & (intensity_frames[after] < bright)
-    )
-
-    difference = intensity_frames[after] - intensity_frames[before]
-    z = difference / np.sqrt(
-        np.square(uncertainty_frames[after]) + np.square(uncertainty_frames[before])
-    )
-    z = z.to(u.dimensionless_unscaled).value
-
-    ratio_noise = np.square(z).mean(where=quiet)
-    for _ in range(3):
-        clipped = quiet & (np.abs(z) < 5 * np.sqrt(ratio_noise))
-        ratio_noise = np.square(z).mean(where=clipped)
+    ratio_noise = frames.ratio_noise(noise_photon, where=~in_box)
 
     ratio_noise
 
 The measured variance is only about a sixth of the prediction.
 The noise of neighboring pixels is also correlated,
 more strongly inside the 8 by 8 blocks of the JPEG compression of these images
-than across the edges of the blocks.
+than across the edges of the blocks,
+which shows in the differences of the same pairs of pixels.
 
 .. jupyter-execute::
+
+    # each image and the one after it, if it began soon after with the same
+    # exposure, as ratio_noise compares them
+    before = dict(time=slice(None, ~0))
+    after = dict(time=slice(1, None))
+    time_frames = frames.inputs.time.ndarray
+    gap = na.ScalarArray((time_frames[1:] - time_frames[:-1]).to(u.s), axes="time")
+    change = np.abs(frames.timedelta[after] - frames.timedelta[before])
+    consecutive = (gap < 25 * u.s) & (change < 0.01 * u.s)
+
+    intensity_frames = frames.outputs
+    variance_frames = np.square(frames.uncertainty(noise_photon))
+    z = intensity_frames[after] - intensity_frames[before]
+    z = z / np.sqrt(variance_frames[after] + variance_frames[before])
+    z = z.to(u.dimensionless_unscaled).value
+
+    mean = (intensity_frames[after] + intensity_frames[before]) / 2
+    clipped = (
+        consecutive
+        & ~in_box
+        & (mean < 10 * u.DN / u.s)
+        & (np.abs(z) < 5 * np.sqrt(ratio_noise))
+    )
 
     left = dict(detector_x=slice(None, ~0))
     right = dict(detector_x=slice(1, None))
