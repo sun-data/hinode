@@ -32,6 +32,13 @@ the image by its exposure time,
 and the exposure time it normalized the image to.
 """
 
+_median_chi2 = 0.454936423119572
+"""
+The median of the square of Gaussian noise of unit variance,
+the chi-squared distribution with one degree of freedom,
+``scipy.stats.chi2.median(1)``.
+"""
+
 _pattern_saturated = re.compile(
     r"\(XRT_SATURATED_PIXELS\) Replaced \d+ saturated pixels with value = ([\d.]+)"
 )
@@ -916,6 +923,13 @@ class Filtergram(
             axes = (images.axis_detector_x, images.axis_detector_y)
             (uncertainty / images.outputs).median(axes)
         """
+        return typing.cast(na.ScalarArray, np.sqrt(self._variance(noise_photon)))
+
+    def _variance(
+        self,
+        noise_photon: u.Quantity | na.AbstractScalar,
+    ) -> na.ScalarArray:
+        """The square of :meth:`uncertainty`."""
         if self.vignetting is None or self.uncertainty_map is None:
             raise ValueError(
                 "The vignetting and the uncertainty map were not loaded. "
@@ -930,4 +944,226 @@ class Filtergram(
         variance = signal * factor / (self.vignetting * self.timedelta)
         variance = variance + np.square(self.uncertainty_map)
 
-        return typing.cast(na.ScalarArray, np.sqrt(variance))
+        return typing.cast(na.ScalarArray, variance)
+
+    def ratio_noise(
+        self,
+        noise_photon: u.Quantity | na.AbstractScalar,
+        where: bool | na.AbstractScalar = True,
+        threshold: u.Quantity = 10 * u.DN / u.s,
+        gap: u.Quantity = 25 * u.s,
+        clip: float = 5,
+        num_iteration: int = 3,
+    ) -> na.ScalarArray:
+        r"""
+        The ratio of the variance of the noise measured in this sequence of
+        images to the variance of :meth:`uncertainty`.
+
+        The noise is measured from the difference between each image and the
+        next.
+        Where the Sun barely changes between the two,
+        the difference is the noise of both images,
+        and dividing it by their uncertainties,
+
+        .. math::
+
+            z = \frac{I_2 - I_1}{\sqrt{\sigma_1^2 + \sigma_2^2}},
+
+        gives a quantity whose variance is the ratio.
+
+        An image is compared with the next only if the next begins after it
+        and within `gap` of it,
+        with the same exposure time,
+        and with the same plate scale and pointing,
+        so that the first pixel of each lands within a pixel of the same place
+        on the Sun,
+        since otherwise the same pixel of the two images sees different parts
+        of the Sun.
+        Of those pixels, only the ones selected by `where` in both images are
+        used,
+        which are not saturated in either,
+        and whose mean signal over the two images is fainter than `threshold`,
+        since brighter ones are more likely to change.
+        The mean is independent of the difference for noise of the same
+        variance in both images,
+        so selecting on it barely biases the ratio,
+        while selecting on the signal of each image would leave out the
+        largest differences near `threshold`.
+        What bias is left comes from :meth:`uncertainty` following the noise
+        of the signal it is found from,
+        and is a few percent for pixels at `threshold`.
+
+        The ratio is first estimated from the median of :math:`z^2`,
+        which the outliers barely move,
+        as that median over the median of the square of Gaussian noise.
+        Cosmic rays and changes of the Sun are then left out by clipping
+        :math:`z` at `clip` times the square root of the ratio,
+        and the ratio is found again as the mean of :math:`z^2` left,
+        which is repeated `num_iteration` times.
+
+        The noise of the images of XRT is less than :meth:`uncertainty`
+        predicts,
+        since the charge of each photon diffuses into the neighboring pixels
+        and the compression of the images removes some of the noise,
+        so this ratio can scale :meth:`uncertainty` to the noise measured.
+        It is measured in faint pixels,
+        and compression removes less of the noise of brighter ones.
+        The errors of the dark subtraction and of the vignetting correction in
+        :attr:`uncertainty_map` are the same in both images and cancel in
+        their difference,
+        so the ratio is of the noise which changes from one image to the next,
+        and scaling all of :meth:`uncertainty` by it scales those errors too,
+        which in faint pixels are a small part of it.
+
+        Parameters
+        ----------
+        noise_photon
+            The factor which sets the photon noise, as in :meth:`uncertainty`.
+        where
+            The pixels to measure the noise in, which should leave out any
+            which change between images, such as those of a jet.
+            It may differ from one image to the next.
+        threshold
+            The mean signal of two images above which their pixels are left
+            out.
+        gap
+            The longest time between the starts of two images compared.
+        clip
+            How many times the measured noise a difference may be before it
+            is left out.
+        num_iteration
+            How many times to clip the differences.
+
+        Returns
+        -------
+        ratio
+            The ratio, one for each entry of any axes other than
+            :attr:`axis_time`, :attr:`axis_detector_x`, and
+            :attr:`axis_detector_y`, such as those of `noise_photon`.
+
+        Raises
+        ------
+        ValueError
+            If there are fewer than two images along :attr:`axis_time`,
+            or if no pair of images compared has a pixel to measure the noise
+            in, for some entry of the other axes.
+
+        Examples
+        --------
+
+        The ratio for the Al_poly images captured while ESIS was observing
+        the Sun, with the photon noise of plasma at 2 MK,
+        away from the jet called event E.
+
+        .. jupyter-execute::
+
+            import numpy as np
+            import astropy.units as u
+            import named_arrays as na
+            import hinode
+
+            images = hinode.xrt.open(
+                time_start="2019-09-30T18:06:11",
+                time_stop="2019-09-30T18:11:01",
+                leak=True,
+                uncertainty=True,
+            ).remove_leak()
+
+            time = images.inputs.time.ndarray[0]
+            response = hinode.xrt.temperature_response("Al_poly", time)
+            variance = hinode.xrt.temperature_response("Al_poly", time, variance=True)
+
+            # The temperature closest to 2 MK
+            index = dict(
+                filter=0,
+                temperature=int(np.argmin(np.abs(response.inputs.ndarray - 2 * u.MK))),
+            )
+            noise_photon = (variance.outputs / response.outputs)[index]
+
+            # Every pixel except those of the jet
+            where = na.ScalarArray.ones(images.outputs[dict(time=0)].shape) > 0
+            where[dict(detector_x=slice(172, 300), detector_y=slice(80, 208))] = False
+
+            images.ratio_noise(noise_photon, where=where)
+        """
+        axis = self.axis_time
+        axes = (axis, self.axis_detector_x, self.axis_detector_y)
+
+        if self.outputs.shape.get(axis, 1) < 2:
+            raise ValueError(
+                "The noise is measured from pairs of images, "
+                f"but there are fewer than two along `axis_time`, {axis!r}."
+            )
+
+        before = {axis: slice(None, ~0)}
+        after = {axis: slice(1, None)}
+
+        # The start of each image, in seconds after the first one.
+        time = typing.cast(na.ScalarArray, self.inputs.time)
+        t = typing.cast(astropy.time.Time, time.ndarray)
+        seconds = na.ScalarArray((t - t.ravel()[0]).to(u.s), axes=time.axes)
+        interval = seconds[after] - seconds[before]
+
+        timedelta = typing.cast(na.ScalarArray, na.as_named_array(self.timedelta))
+        change = np.abs(timedelta[after] - timedelta[before])
+
+        # The place on the Sun of the first pixel of each image, without the
+        # roll, which changes little from one image to the next.
+        crval = typing.cast(na.Cartesian2dVectorArray, self.inputs.crval.position)
+        cdelt = typing.cast(na.Cartesian2dVectorArray, self.inputs.cdelt.position)
+        crpix = self.inputs.crpix.components
+        crpix_x = typing.cast(na.ScalarArray, crpix[self.axis_detector_x])
+        crpix_y = typing.cast(na.ScalarArray, crpix[self.axis_detector_y])
+        first_x = crval.x - cdelt.x * crpix_x
+        first_y = crval.y - cdelt.y * crpix_y
+        aligned = (
+            (np.abs(cdelt.x[after] / cdelt.x[before] - 1) < 1e-3)
+            & (np.abs(cdelt.y[after] / cdelt.y[before] - 1) < 1e-3)
+            & (np.abs(first_x[after] - first_x[before]) < np.abs(cdelt.x[before]))
+            & (np.abs(first_y[after] - first_y[before]) < np.abs(cdelt.y[before]))
+        )
+
+        consecutive = (
+            (interval > u.Quantity(0, u.s))
+            & (interval < gap)
+            & (change < 0.01 * u.s)
+            & aligned
+        )
+
+        # Indexing ignores the time axis of a mask without one.
+        selected = typing.cast(na.ScalarArray, na.as_named_array(where))
+        selected = selected[before] & selected[after]
+        if self.saturated is not None:
+            selected = selected & ~self.saturated[before] & ~self.saturated[after]
+
+        intensity = self.outputs
+        mean = (intensity[before] + intensity[after]) / 2
+
+        variance = self._variance(noise_photon)
+        z2 = np.square(intensity[after] - intensity[before])
+        z2 = z2 / (variance[after] + variance[before])
+        z2 = z2.to(u.dimensionless_unscaled).value
+
+        quiet = consecutive & selected & (mean < threshold) & np.isfinite(z2)
+
+        if np.any(quiet.sum(axes) == 0):
+            raise ValueError(
+                "No pair of images compared has a pixel to measure the noise in. "
+                "Each image is compared only with the next one, "
+                "if it begins within `gap` after it, with the same exposure, "
+                "plate scale, and pointing, "
+                "and only in the pixels selected by `where`, not saturated, "
+                "and whose mean over the two is fainter than `threshold`."
+            )
+
+        # NaN where a pixel is not quiet, which the median leaves out
+        masked = np.where(quiet, z2, np.nan)
+        # `np.nanmedian` takes the names of the axes of a named array,
+        # which the annotations of numpy do not allow.
+        median = np.nanmedian(masked, axis=axes)  # type: ignore[call-overload]
+        ratio = typing.cast(na.ScalarArray, median) / _median_chi2
+        for _ in range(num_iteration):
+            clipped = quiet & (z2 <= np.square(clip) * ratio)
+            ratio = z2.mean(axes, where=clipped)
+
+        return typing.cast(na.ScalarArray, ratio)
