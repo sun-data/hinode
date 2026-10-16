@@ -302,8 +302,6 @@ near the temperature of most of the plasma in the box.
         axis_filter="channel",
     )[dict(temperature=slice(0, 51))]
 
-    logt = np.log10(response_xrt.inputs / u.K)
-
     # F at log T = 6.3
     noise_photon = (variance_xrt.outputs / response_xrt.outputs)[dict(temperature=26)]
 
@@ -494,8 +492,12 @@ Invert every pixel of the box.
 
 For comparison, invert AIA alone too,
 and find the ratio of the XRT intensity each DEM predicts to the one observed.
-The emission measure in each step of temperature is the DEM times the step in
-:math:`\log_{10} T`.
+:func:`utu.dem.plowman` takes the DEM and the responses to be linear in
+:math:`\log_{10} T` between the temperatures,
+and fits each intensity with the integral of their product.
+:func:`utu.dem.emission_measure` gives the emission measure each temperature
+stands for in that integral,
+so the XRT intensity predicted from it is the one the inversion fit.
 
 .. jupyter-execute::
 
@@ -507,11 +509,10 @@ The emission measure in each step of temperature is the DEM times the step in
         axis_temperature="temperature",
     )
 
-    step = 0.05
-
     # the ratio of the XRT intensity a DEM predicts to the one observed
     def ratio_xrt(dem):
-        predicted = (dem.outputs * outputs_xrt * step).sum("temperature")
+        emission_measure = utu.dem.emission_measure(dem, "temperature")
+        predicted = (emission_measure * outputs_xrt).sum("temperature")
         ratio = (predicted / intensity_xrt).to(u.dimensionless_unscaled)
         return ratio[dict(channel=0)]
 
@@ -536,15 +537,30 @@ Results
 
 The emission measure in four ranges of temperature, the integral of the DEM
 over each.
+The DEM is per unit :math:`\log_{10} T`,
+so its inputs are replaced with :math:`\log_{10} T` before it is integrated with
+:meth:`~named_arrays.AbstractFunctionArray.integrate`,
+which along an axis of samples uses the trapezoid rule.
+That is exact over a range whose ends are temperatures of the DEM,
+since :func:`utu.dem.plowman` takes the DEM to be linear in
+:math:`\log_{10} T` between them.
 
 .. jupyter-execute::
 
     ranges = [(5.6, 6.0), (6.0, 6.3), (6.3, 6.6), (6.6, 7.0)]
 
-    em = {
-        r: (dem.outputs * step).sum("temperature", where=(logt >= r[0]) & (logt < r[1]))
-        for r in ranges
-    }
+    logt = np.log10(dem.inputs / u.K)
+    dem_logt = dem.replace(inputs=logt)
+
+    def node(value):
+        # the index of the temperature at this value of log T
+        return int(np.argmin(np.abs(logt - value).ndarray))
+
+    def integral(lower, upper):
+        index = dict(temperature=slice(node(lower), node(upper) + 1))
+        return dem_logt[index].integrate("temperature").outputs
+
+    em = {r: integral(*r) for r in ranges}
 
     with astropy.visualization.quantity_support():
         fig, axs = plt.subplots(
